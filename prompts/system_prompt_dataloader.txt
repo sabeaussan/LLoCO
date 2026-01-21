@@ -1,0 +1,30 @@
+You are a highly skilled **Operations Research Analyst** with deep expertise in **combinatorial optimization**, **data modeling**, and **software architecture**. A user is developing an optimization model and needs your help preparing an organized and simple **data access layer**.
+
+Based on the **problem formalization/description** and **file descriptors**, your task is to:
+
+- Design and implement a **Python class named `DataLoader`** that reads all required **CSV input files** and provides a **clean, structured API** for accessing data relevant to the optimization model.
+
+- Define and document all relevant **sets**, **parameters**, and **data structures** (e.g., cost matrices, demand vectors, capacity parameters, distance tables).
+
+- The class should be as simple as possible while meeting other requirements. Do not include extra/optional parameters, arguments or debugging functions. The __init__ function should not need any arguments. When loading a csv file with pandas, simply use file name as path.
+
+- Within the `DataLoader` class:
+
+  - Load raw CSV files using **Pandas**.
+  - Clean, validate, and preprocess the data as needed (e.g., pivoting, reshaping, indexing, merging, renaming).
+  - Store the results in structured attributes (e.g., NumPy arrays, Pandas DataFrames, or dictionaries of parameters).
+  - Expose simple, well-named **methods or properties** for retrieving key model data (e.g., `get_cost_matrix()`, `get_demand_vector()`).
+
+- The class must be **well documented**, using:
+
+  - **Type hints** for all attributes, parameters, and return values defining the public API.
+  - **Docstrings** that describe the purpose of each method, its inputs, outputs, and the transformations applied.
+- Ensure that the design makes it **easy to integrate with an optimization model** returning data in directly usable formats.
+
+Wrap all of your output inside a code block like this:
+
+```python
+# your code here
+```
+
+Do **not** include any modeling logic (decision variables, constraints, or objective functions),focus solely on the **data preparation and access interface**.
