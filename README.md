@@ -4,18 +4,19 @@ LLoCO (**LL**M-guided **o**perations and **C**ombinatorial **O**ptimization) is 
 
 ## How to use
 The projects is structured as follows:
-.
- * [tree-md](./tree-md)
- * [dir2](./dir2)
-   * [file21.ext](./dir2/file21.ext)
-   * [file22.ext](./dir2/file22.ext)
-   * [file23.ext](./dir2/file23.ext)
- * [dir1](./dir1)
-   * [file11.ext](./dir1/file11.ext)
-   * [file12.ext](./dir1/file12.ext)
- * [file_in_root.ext](./file_in_root.ext)
- * [README.md](./README.md)
- * [dir3](./dir3)
+
+>.
+>└── LLoCo/
+>    ├── main.py
+>    ├── prompts/
+>    ├── ...
+>    ├── problems/
+>    │   └── problem_name/
+>   │       ├── user_input.md
+>    │       ├── data.csv
+>    │       └── some_more_data.csv
+>    └── datasets/
+>        └── eval_datasets
 
 A `user_input.md` file should be written inside the corresponding `problem_name` folder under `problems`. To run LLoCO:
 `python3 main.py -f problem_name`
