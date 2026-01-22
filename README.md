@@ -1,21 +1,21 @@
-# LLoCO
+# LLoCO
 
 LLoCO (**LL**M-guided **o**perations and **C**ombinatorial **O**ptimization) is a project that aims to bridge the gap between Operations Research and a non expert user. The system requires a high-level and possibly ambiguous description of the problem as input and returns a report detailing actionnable insights based on the solution found. Currently, LLoCO is able to solve Linear Programs, as well as Mixed-Integer Linear Programs. It also only supports CSV files as data input.  An architecure overview of the system is available ![LLoCO system architecture](/assets/images/LLoCO_arch.png)
 
 ## How to use
 The projects is structured as follows:
 .
-└── LLoCo/
-    ├── main.py
-    ├── prompts/
-    ├── ...
-    ├── problems/
-    │   └── problem_name/
-    │       ├── user_input.md
-    │       ├── data.csv
-    │       └── some_more_data.csv
-    └── datasets/
-        └── eval_datasets
+ * [tree-md](./tree-md)
+ * [dir2](./dir2)
+   * [file21.ext](./dir2/file21.ext)
+   * [file22.ext](./dir2/file22.ext)
+   * [file23.ext](./dir2/file23.ext)
+ * [dir1](./dir1)
+   * [file11.ext](./dir1/file11.ext)
+   * [file12.ext](./dir1/file12.ext)
+ * [file_in_root.ext](./file_in_root.ext)
+ * [README.md](./README.md)
+ * [dir3](./dir3)
 
 A `user_input.md` file should be written inside the corresponding `problem_name` folder under `problems`. To run LLoCO:
 `python3 main.py -f problem_name`
