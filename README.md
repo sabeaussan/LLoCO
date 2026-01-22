@@ -6,16 +6,27 @@ LLoCO (**LL**M-guided **o**perations and **C**ombinatorial **O**ptimization) is 
 The projects is structured as follows:
 
 >.
+>
 >└── LLoCo/
+>
 >    ├── main.py
+>
 >    ├── prompts/
+>
 >    ├── ...
+>
 >    ├── problems/
+>
 >    │   └── problem_name/
+>
 >   │       ├── user_input.md
+>
 >    │       ├── data.csv
+>
 >    │       └── some_more_data.csv
+>
 >    └── datasets/
+>
 >        └── eval_datasets
 
 A `user_input.md` file should be written inside the corresponding `problem_name` folder under `problems`. To run LLoCO:
