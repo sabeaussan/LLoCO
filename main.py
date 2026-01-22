@@ -92,15 +92,19 @@ def main(args):
 	#--------------- PROBLEM REFINEMENT ------------------
 	with SpinnerManager("Analyzing the user inputs ...", active=args.verbosity > 0):
 		csv_files_summary, has_csv_file = io_utils.get_csv_files_summary(problem_path)
-		refinement_questions = io_utils.refine_problem_description(
-			os.path.join(PROMPT_DIR, "system_prompt_problem_framing.txt"),
-			high_level_description + "\n\n" + csv_files_summary
-		)
+		if args.interactive:
+			refinement_questions = io_utils.refine_problem_description(
+				os.path.join(PROMPT_DIR, "system_prompt_problem_framing.txt"),
+				high_level_description + "\n\n" + csv_files_summary
+			)
 
-	refinement = "# ADDITIONAL DETAILS\n\n"
-	for q in refinement_questions["questions"]:
-		answer = input(f"🤖 {q['question']} : ")
-		refinement += f"Q: {q['question']}\nA: {answer}\n"
+	if args.interactive:
+		refinement = "# ADDITIONAL DETAILS\n\n"
+		for q in refinement_questions["questions"]:
+			answer = input(f"🤖 {q['question']} : ")
+			refinement += f"Q: {q['question']}\nA: {answer}\n"
+	else:
+		refinement = ""
 
 	#--------------- PROBLEM FORMALIZATION ------------------
 	with SpinnerManager("Refining and formalizing the problem ...", active=args.verbosity > 0):
@@ -151,14 +155,25 @@ def main(args):
 		code_print = llm_utils.print_solution(sys_prompt_path, complete_description+"\n\n" + csv_files_summary, solution_code, api_doc)
 		solution_code += "\n\n" + code_print
 	optim_summary = run_solution(problem_path, solution_code)
-	print(optim_summary)
+	optim_summary_path = os.path.join(problem_path, "optim_summary.txt")
+	with open(optim_summary_path, "w") as f:
+		f.write(optim_summary.stdout)
+		if optim_summary.stderr:
+			f.write("\n\n[stderr]\n")
+			f.write(optim_summary.stderr)
 
-	if not optim_summary.stderr=="":
-		raise ValueError(optim_summary.stderr)
+	if args.verbosity > 1:
+		print(optim_summary)
+
+	# if not optim_summary.stderr=="":
+	# 	raise ValueError(optim_summary.stderr)
 
 	if args.verbosity > 0:
 		sys_prompt_path = os.path.join(PROMPT_DIR, "system_prompt_write_report.txt")
 		report = llm_utils.write_report(sys_prompt_path, complete_description, optim_summary.stdout)
+		report_path = os.path.join(problem_path, "report.txt")
+		with open(report_path, "w") as f:
+			f.write(report)
 		print("\n🤖 Lets see what we got : \n\n")
 		print(report)
 		
@@ -172,6 +187,9 @@ if __name__ == "__main__":
 	)
 	parser.add_argument(
 		"-v", "--verbosity", type=int, default=1, required=False, help="Verbosity level : only print code exec (0), print spinner (1) and full debug (2)."
+	)
+	parser.add_argument(
+		"-i", "--interactive", action="store_true", help="If set, LLoCO will ask multiple questions to dismiss potential ambiguity."
 	)
 	parser.add_argument(
 		"-b", "--baseline", action="store_true", help="Run baseline."

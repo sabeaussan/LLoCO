@@ -9,7 +9,7 @@ def openai_ask_requests(messages, model="gpt-5", response_format=None):
 	headers = {
 		"Content-Type": "application/json",
 		"Cache-Control": "no-cache",
-		"api-key": open(os.path.join(os.path.expanduser('~'), ".akr_key.txt"), 'r').read().strip()
+		"api-key": open(os.path.join(os.getcwd(), ".api_key.txt"), 'r').read().strip()
 	}
 
 	data = {
