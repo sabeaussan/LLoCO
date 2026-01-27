@@ -6,7 +6,7 @@ import random
 
 def show_logo():
 	# TODO : add check working directory before loading the logo
-	with open("UI/logo.txt", "r") as file:
+	with open("UI/logo.txt", "r", encoding="utf-8") as file:
 		logo = file.read()
 	print(logo)
       

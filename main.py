@@ -5,6 +5,7 @@ import code_utils
 import io_utils
 import subprocess
 from UI.utils import show_logo, SpinnerManager
+import sys
 
 PROBLEM_BASE_DIR = "problems"
 PROMPT_DIR = "prompts"
@@ -31,21 +32,21 @@ def run_solution(problem_path, code):
 	import shutil
 
 	output_file_path = os.path.join(problem_path, "solution.py")
-	with open(output_file_path, "w") as f:
+	with open(output_file_path, "w", encoding="utf-8") as f:
 		f.write(code)
 	print()
 
 	# Copy a libraries file from the current directory to the problem directory
 	# TODO : messy, make the files a python package
 	# TODO : check that result conatains no error or traceback -> self correct
-	shutil.copy('optimization_utils.py', problem_path+"/optimization_utils.py")
-	shutil.copy('utils.py', problem_path+"/utils.py")
-	shutil.copy('log_utils.py', problem_path+"/log_utils.py")
-	shutil.move('data.py', problem_path+"/data.py")
+	shutil.copy('optimization_utils.py', os.path.join(problem_path,"optimization_utils.py"))
+	shutil.copy('utils.py', os.path.join(problem_path,"utils.py"))
+	shutil.copy('log_utils.py', os.path.join(problem_path,"log_utils.py"))
+	shutil.move('data.py', os.path.join(problem_path,"data.py"))
 
 	# Run the solution
 	results = subprocess.run(
-		["python", "solution.py"],
+		[sys.executable, "solution.py"],
 		cwd=problem_path,
 		stdout=subprocess.PIPE,
 		stderr=subprocess.PIPE,
@@ -57,7 +58,7 @@ def run_baseline(problem_path, high_level_description):
 	sys_prompt_path = os.path.join(PROMPT_DIR, "system_prompt_baseline.txt")
 	code = llm_utils.ask_baseline(sys_prompt_path, high_level_description)
 	output_file_path = os.path.join(problem_path, "baseline.py")
-	with open(output_file_path, "w") as f:
+	with open(output_file_path, "w", encoding="utf-8") as f:
 		f.write(code)
 	results = subprocess.run(["python", "baseline.py"], cwd=problem_path)
 	print(results)
@@ -70,7 +71,7 @@ def get_high_level_description(problem_path):
 	
 	problem_description_path = os.path.join(problem_path, "user_input.md")
 	high_level_description = "# PROBLEM DESCRIPTION\n\n"
-	with open(problem_description_path, "r") as f:
+	with open(problem_description_path, "r", encoding="utf-8") as f:
 		high_level_description += f.read()
 	return high_level_description
 
@@ -124,7 +125,7 @@ def main(args):
 
 			# Create data.py
 			code_data = llm_utils.data_processing(sys_prompt_path, context)
-			with open("data.py", "w") as f:
+			with open("data.py", "w", encoding="utf-8") as f:
 				f.write(code_data)
 			
 			# Generate API documentation for DataLoader
@@ -156,23 +157,23 @@ def main(args):
 		solution_code += "\n\n" + code_print
 	optim_summary = run_solution(problem_path, solution_code)
 	optim_summary_path = os.path.join(problem_path, "optim_summary.txt")
-	with open(optim_summary_path, "w") as f:
+	with open(optim_summary_path, "w", encoding="utf-8") as f:
 		f.write(optim_summary.stdout)
 		if optim_summary.stderr:
 			f.write("\n\n[stderr]\n")
 			f.write(optim_summary.stderr)
 
-	if args.verbosity > 1:
+	if args.verbosity > 0:
 		print(optim_summary)
 
 	# if not optim_summary.stderr=="":
 	# 	raise ValueError(optim_summary.stderr)
 
-	if args.verbosity > 0:
+	if args.verbosity > 1:
 		sys_prompt_path = os.path.join(PROMPT_DIR, "system_prompt_write_report.txt")
 		report = llm_utils.write_report(sys_prompt_path, complete_description, optim_summary.stdout)
 		report_path = os.path.join(problem_path, "report.txt")
-		with open(report_path, "w") as f:
+		with open(report_path, "w", encoding="utf-8") as f:
 			f.write(report)
 		print("\n🤖 Lets see what we got : \n\n")
 		print(report)

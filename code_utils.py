@@ -38,8 +38,8 @@ from optimization_utils import (
 	add_constraint
 )
 from log_utils import (
-    print_objective_solution_value, 
-    interpret_status,
+	print_objective_solution_value, 
+	interpret_status,
 	get_solution_values
 )
 from data import DataLoader
@@ -59,6 +59,6 @@ print_objective_solution_value(solver)
 	return source_code
 
 def outer_code_parse(contents):
-    code = contents.split('```python')[1]
-    code = "'''".join(code.split('```')[:-1])
-    return code
+	code = contents.split('```python')[1]
+	code = "'''".join(code.split('```')[:-1])
+	return code

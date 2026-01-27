@@ -90,11 +90,13 @@ def _get_basic_csv_summary(file_path):
 	"""
 	import pandas as pd
 	import io
+	from pathlib import Path
+
 	buffer = io.StringIO()
 	pd.set_option('display.max_rows', 10)
 	pd.set_option('display.max_columns', 10)
 	df = pd.read_csv(file_path)
-	fname = file_path.split("/")[-1]
+	fname = Path(file_path).name
 	summary = f"*** Input file: {fname}\n"
 	df.info(buf=buffer)
 	info = buffer.getvalue()
@@ -138,4 +140,5 @@ def convert_file_to_json(directory, complete_description):
 			response += llm_utils.openai_ask_requests(messages, response_format=response_format_csv)
 			response += "\n\n"
 			has_csv_file = True
+	
 	return response, has_csv_file

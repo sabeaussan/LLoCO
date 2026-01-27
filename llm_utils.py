@@ -84,7 +84,6 @@ Your task is only to implement the solution visualization. To do so, you **MUST*
 		{"role": "user", "content": context},
 	]
 	raw_response = openai_ask_requests(messages)
-	print(raw_response)
 	source_code = code_utils.outer_code_parse(raw_response)
 	return source_code
 
