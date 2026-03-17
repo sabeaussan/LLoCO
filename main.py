@@ -31,8 +31,10 @@ OBJ_RE = re.compile(r"Optimization objective value:\s*([+-]?\d+(?:\.\d+)?)")
 def _hr(char: str = "─", n: int = 70) -> str:
     return char * n
 
+
 def _wlen(s: str) -> int:
     return wcswidth(s)
+
 
 def _box(title: str, lines: List[str]) -> str:
     width = max(_wlen(title), *(_wlen(x) for x in lines)) + 4
@@ -152,7 +154,7 @@ def _extract_error_line(stderr_text: str) -> Optional[str]:
 def batch_run(
     dataset_name: str,
     data_root: str = "datasets",
-    problems_root: str = "problems",
+    problems_root: str = PROBLEM_BASE_DIR,
     all_flag: bool = False,
     single_id: Optional[int] = None,
     ids_csv: Optional[str] = None,
@@ -204,6 +206,7 @@ def batch_run(
                     f"Dataset: {dataset_name}",
                     f"JSON:    {json_path}",
                     f"Mode:    {_mode_str(all_flag, single_id, ids_csv, range_pair, start, limit)}",
+                    f"Root:    {problems_root}",
                     f"Total:   {len(selected_ids)} problem(s)",
                 ],
             )
@@ -211,6 +214,7 @@ def batch_run(
         print()
 
     total = len(selected_ids)
+    main_script = os.path.abspath(__file__)
 
     for idx, pid in enumerate(selected_ids, start=1):
         if pid not in by_id:
@@ -261,7 +265,16 @@ def batch_run(
             print(f"[{idx}/{total}] ▶ Running {problem_folder}")
             print(_hr())
 
-        cmd = [sys.executable, "main.py", "-f", problem_folder, "-v", str(verbosity)]
+        cmd = [
+            sys.executable,
+            main_script,
+            "-f",
+            problem_folder,
+            "--problems-root",
+            problems_root,
+            "-v",
+            str(verbosity),
+        ]
         run = subprocess.run(cmd)
 
         optim_path = os.path.join(problem_path, "optim_summary.txt")
@@ -395,7 +408,8 @@ def get_high_level_description(problem_path):
 
 def main(args):
     problem_dir = args.fname
-    problem_path = os.path.join(PROBLEM_BASE_DIR, problem_dir)
+    problems_root = args.problems_root if getattr(args, "problems_root", None) else PROBLEM_BASE_DIR
+    problem_path = os.path.join(problems_root, problem_dir)
 
     if args.verbosity > 0:
         show_logo()
@@ -533,12 +547,17 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--verbosity", type=int, default=1)
     parser.add_argument("-i", "--interactive", action="store_true")
     parser.add_argument("-b", "--baseline", action="store_true")
+    parser.add_argument(
+        "--problems-root",
+        default=PROBLEM_BASE_DIR,
+        help="Root directory containing problem folders for single runs.",
+    )
 
     # --- Batch ---
     p_batch = sub.add_parser("batch", help="Run a batch from a dataset JSONL.")
     p_batch.add_argument("--dataset", required=True)
     p_batch.add_argument("--data-root", default="datasets")
-    p_batch.add_argument("--problems-root", default="problems")
+    p_batch.add_argument("--problems-root", default=PROBLEM_BASE_DIR)
 
     p_batch.add_argument("--all", action="store_true", help="Run all problems in dataset")
     p_batch.add_argument("--id", type=int, default=None, help="Run a single problem id")
