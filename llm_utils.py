@@ -4,82 +4,326 @@ import requests
 import utils
 import time
 import ast
+import re
+import subprocess
+import sys
+import tempfile
+import shutil
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _defined_names_in_code(code: str) -> list[str]:
-	"""
-	Retourne une liste de noms "définis" au niveau module (imports, assign, defs),
-	utile pour contraindre le LLM à ne pas inventer d'identifiants.
-	"""
-	try:
-		tree = ast.parse(code)
-	except Exception:
-		return []
+    """
+    Retourne une liste de noms "définis" au niveau module (imports, assign, defs),
+    utile pour contraindre le LLM à ne pas inventer d'identifiants.
+    """
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
 
-	defined = set()
-	for node in ast.walk(tree):
-		if isinstance(node, ast.Import):
-			for a in node.names:
-				defined.add(a.asname or a.name.split(".")[0])
-		elif isinstance(node, ast.ImportFrom):
-			for a in node.names:
-				if a.name != "*":
-					defined.add(a.asname or a.name)
-		elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
-			defined.add(node.name)
-		elif isinstance(node, ast.Assign):
-			for t in node.targets:
-				if isinstance(t, ast.Name):
-					defined.add(t.id)
-		elif isinstance(node, ast.AnnAssign):
-			if isinstance(node.target, ast.Name):
-				defined.add(node.target.id)
-	return sorted(defined)
+    defined = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                defined.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name != "*":
+                    defined.add(a.asname or a.name)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    defined.add(t.id)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                defined.add(node.target.id)
+    return sorted(defined)
 
 
-def _llm_step_with_gating(messages, code_prefix: str, max_tries: int = 3) -> str:
-    last_raw = None
+# ---------------------------------------------------------------------------
+# Safe block concatenation
+# ---------------------------------------------------------------------------
 
-    for _ in range(max_tries):
-        last_raw = openai_ask_requests(messages)
-        snippet = code_utils.outer_code_parse(last_raw)
+def _safe_join(base: str, snippet: str) -> str:
+    """
+    Concatenate two Python source blocks with a guaranteed blank-line separator.
 
-        # 1) sanitize unicode + fences + basic compile repair on the SNIPPET alone
+    This prevents the class of SyntaxError where a snippet starts immediately
+    after the last character of the previous block with no newline, producing
+    invalid constructs like:
+        solver = define_solver("SCIP")num_products = 3
+    """
+    base = base.rstrip()
+    snippet = snippet.strip()
+    if not snippet:
+        return base
+    return base + "\n\n" + snippet + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Narrative-line filter
+# ---------------------------------------------------------------------------
+_NARRATIVE_PATTERNS = re.compile(
+    r"""
+    ^\s*(
+        add\s+this\s+code
+      | code\s+to\s+insert
+      | insert\s+the\s+following
+      | place\s+this\s+(after|before|here)
+      | here\s+is\s+the\s+code
+      | replace\s+the\s+line
+      | step\s+\d+\s*[:\-]
+      | note\s*:
+      | explanation\s*:
+      | output\s*:
+      | usage\s*:
+      | example\s*:
+      | instructions?\s*:
+      | updated?\s+code\s*:
+      | new\s+code\s*:
+      | solution\s*:
+    )\b
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def _strip_narrative_lines(code: str) -> str:
+    """
+    Remove / comment-out lines that are clearly natural-language instructions
+    leaked by the LLM (e.g. "Add this code right after:", "Code to insert:").
+    """
+    _PY_STARTERS = (
+        "def ", "class ", "import ", "from ", "return ", "if ", "elif ",
+        "else", "for ", "while ", "try", "except", "with ", "raise ",
+        "pass", "break", "continue", "yield", "async ", "await ", "@",
+        "lambda ",
+    )
+
+    cleaned = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            cleaned.append(line)
+            continue
+        if (
+            any(stripped.startswith(kw) for kw in _PY_STARTERS)
+            or "=" in stripped
+            or "(" in stripped
+            or stripped[0].isdigit()
+        ):
+            cleaned.append(line)
+            continue
+        if _NARRATIVE_PATTERNS.match(stripped):
+            cleaned.append("# [narrative removed] " + stripped)
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+# ---------------------------------------------------------------------------
+# Non-integer value sanitizer  (fix for Codex P2)
+# ---------------------------------------------------------------------------
+
+# Matches any use of dtype=np.int64 / dtype=np.int32 / dtype=int in generated code
+_INT_DTYPE_PATTERN = re.compile(
+    r"dtype\s*=\s*(np\.int(?:64|32|16|8)?|int)\b",
+)
+
+# Matches .astype(int) or .astype(np.int64) etc.
+_ASTYPE_INT_PATTERN = re.compile(
+    r"\.astype\s*\(\s*(int|np\.int(?:64|32|16|8)?)\s*\)",
+)
+
+# Matches to_numpy(dtype=np.int64) etc.
+_TO_NUMPY_INT_PATTERN = re.compile(
+    r"to_numpy\s*\(\s*dtype\s*=\s*(np\.int(?:64|32|16|8)?|int)\s*\)",
+)
+
+
+def _patch_int_casts(code: str) -> str:
+    """
+    Replace unsafe integer casts in LLM-generated data loading code with
+    float64 equivalents, then add a strict integer validation guard.
+
+    Rationale (Codex P2):
+    - CSV data may contain decimal values (e.g. 2.9).
+    - Casting directly to int silently truncates (2.9 → 2).
+    - This corrupts optimization coefficients and produces wrong results.
+
+    Strategy:
+    1. Replace dtype=np.int64 / .astype(int) / to_numpy(dtype=int)
+       with their float64 equivalent.
+    2. Inject a validation helper at the top of the snippet that raises
+       ValueError if any column claimed to be integer actually contains
+       non-integer float values.
+
+    The validation helper is injected only once (idempotent).
+    """
+    # Step 1: replace int dtypes with float64
+    code = _INT_DTYPE_PATTERN.sub("dtype=np.float64", code)
+    code = _ASTYPE_INT_PATTERN.sub(".astype(np.float64)", code)
+    code = _TO_NUMPY_INT_PATTERN.sub("to_numpy(dtype=np.float64)", code)
+
+    # Step 2: inject validation helper if not already present
+    guard_marker = "# __lloco_int_guard__"
+    if guard_marker not in code:
+        guard = (
+            f"{guard_marker}\n"
+            "import numpy as _np\n"
+            "def _validate_integer_column(arr, name='column'):\n"
+            "    \"\"\"Raise ValueError if arr contains non-integer float values.\"\"\"\n"
+            "    arr = _np.asarray(arr, dtype=float)\n"
+            "    if not _np.all(arr == _np.floor(arr)):\n"
+            "        bad = arr[arr != _np.floor(arr)]\n"
+            "        raise ValueError(\n"
+            "            f'Column {name!r} contains non-integer values '\n"
+            "            f'(e.g. {bad[:3].tolist()}). '\n"
+            "            f'Use float variables or clean the data first.'\n"
+            "        )\n"
+            "    return arr.astype(int)\n\n"
+        )
+        code = guard + code
+
+    return code
+
+
+# ---------------------------------------------------------------------------
+# INFEASIBLE detection helpers
+# ---------------------------------------------------------------------------
+
+_INFEASIBLE_PATTERNS = re.compile(
+    r"(INFEASIBLE|infeasible|No\s+solution\s+exists|MPSOLVER_INFEASIBLE"
+    r"|model\s+is\s+infeasible|problem\s+is\s+infeasible)",
+    re.IGNORECASE,
+)
+
+_ZERO_OBJ_PATTERN = re.compile(
+    r"Optimization objective value:\s*0\.0",
+    re.IGNORECASE,
+)
+
+
+def _is_infeasible(stdout: str, stderr: str) -> bool:
+    """Return True if the solver output indicates an INFEASIBLE model."""
+    combined = (stdout or "") + (stderr or "")
+    return bool(_INFEASIBLE_PATTERNS.search(combined))
+
+
+def _probe_solution(code: str, timeout: int = 60) -> tuple[str, str, int]:
+    """
+    Run `code` in an isolated temp directory and return (stdout, stderr, returncode).
+    Dependencies (optimization_utils.py, utils.py, log_utils.py, data.py) are
+    copied from the current working directory if they exist.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="lloco_probe_")
+    try:
+        for dep in ["optimization_utils.py", "utils.py", "log_utils.py", "data.py"]:
+            src = os.path.join(os.getcwd(), dep)
+            if os.path.exists(src):
+                shutil.copy(src, os.path.join(tmpdir, dep))
+
+        script = os.path.join(tmpdir, "probe_solution.py")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        try:
+            result = subprocess.run(
+                [sys.executable, "probe_solution.py"],
+                cwd=tmpdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=timeout,
+            )
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return "", "PROBE_TIMEOUT", 1
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Core gating loop
+# ---------------------------------------------------------------------------
+
+def _llm_step_with_gating(
+    messages,
+    code_prefix: str,
+    max_tries: int = 4,
+    allow_undefined: bool = False,
+) -> str:
+    """
+    Calls the LLM and validates the returned snippet before accepting it.
+
+    Validation layers (applied in order):
+      1. _strip_narrative_lines  – remove leaked instruction text
+      2. sanitize_python_code    – strip fences, fix unicode, auto-repair
+      3. _safe_join              – guarantee \\n\\n separator before compile
+      4. compile()               – catches SyntaxError / invalid syntax
+      5. find_undefined_names    – catches NameError-class hallucinations
+                                   (skipped when allow_undefined=True)
+    """
+    last_snippet = ""
+
+    for attempt in range(max_tries):
+        try:
+            raw = openai_ask_requests(messages)
+        except RuntimeError:
+            raise
+
+        snippet = code_utils.outer_code_parse(raw)
+        snippet = _strip_narrative_lines(snippet)
         snippet, _ = code_utils.sanitize_python_code(snippet)
-
-        # 2) add your type comments
         snippet = utils.add_type_comments(snippet)
 
-        combined = code_prefix.rstrip() + "\n\n" + snippet.strip() + "\n"
+        last_snippet = snippet
 
-        # 3) compile check on combined (catches many runtime-ish syntax leftovers)
+        combined = _safe_join(code_prefix, snippet)
+
         try:
             compile(combined, "solution.py", "exec")
-        except Exception as e:
-            messages = messages + [{
-                "role": "system",
-                "content": f"Your previous output does not compile when combined with existing code: {e}. "
-                           f"Regenerate ONLY valid Python code."
-            }]
+        except SyntaxError as e:
+            feedback = (
+                f"Your previous output has a SyntaxError when combined with the "
+                f"existing code: {e}. "
+                f"Regenerate ONLY valid Python code. "
+                f"Do NOT include markdown fences, natural-language instructions, "
+                f"prose, or any text that is not valid Python. "
+                f"If you need to explain something, use Python comments (#). "
+                f"Make sure your code starts on a new line and is complete."
+            )
+            messages = messages + [{"role": "system", "content": feedback}]
             continue
 
-        # 4) undefined-names check
-        undef = code_utils.find_undefined_names(combined)
-        if not undef:
-            return snippet
+        if not allow_undefined:
+            undef = code_utils.find_undefined_names(combined)
+            if undef:
+                feedback = (
+                    "Your previous output introduced undefined names: "
+                    + ", ".join(undef)
+                    + ". Regenerate ONLY the requested Python code. "
+                      "Use ONLY already-defined identifiers, or define them "
+                      "BEFORE first use. "
+                      "Do NOT invent helper functions or variables that are "
+                      "not yet defined."
+                )
+                messages = messages + [{"role": "system", "content": feedback}]
+                continue
 
-        messages = messages + [{
-            "role": "system",
-            "content": (
-                "Your previous output introduced undefined names: "
-                + ", ".join(undef)
-                + ". Regenerate ONLY the requested Python code. "
-                  "Use ONLY already-defined identifiers, or define them BEFORE first use."
-            )
-        }]
+        return snippet  # ✅ passed all checks
 
-    # best effort
-    return snippet if last_raw else ""
+    return last_snippet
 
+
+# ---------------------------------------------------------------------------
+# OpenAI / Akkodis API wrapper
+# ---------------------------------------------------------------------------
 
 def openai_ask_requests(
     messages,
@@ -90,14 +334,13 @@ def openai_ask_requests(
     max_retries=4,
 ):
     """
-    Version robuste:
+    Robust wrapper:
     - support .api_key.txt / api_key.txt / OPENAI_API_KEY
-    - évite JSONDecodeError
-    - messages d'erreur lisibles (HTTP + preview)
-    - retry automatique (timeout / 429 / 5xx)
+    - avoids JSONDecodeError
+    - readable error messages (HTTP + preview)
+    - automatic retry (timeout / 429 / 5xx)
     """
 
-    # -------- API KEY (fix .api_key.txt) --------
     api_key = os.environ.get("OPENAI_API_KEY")
 
     if not api_key:
@@ -109,9 +352,10 @@ def openai_ask_requests(
                 break
 
     if not api_key:
-        raise RuntimeError("API key not found (.api_key.txt / api_key.txt / OPENAI_API_KEY).")
+        raise RuntimeError(
+            "API key not found (.api_key.txt / api_key.txt / OPENAI_API_KEY)."
+        )
 
-    # -------- URL --------
     url = (
         f"https://cld.akkodis.com/api/openai/deployments/models-{model}"
         f"/chat/completions?api-version=2024-12-01-preview"
@@ -137,12 +381,10 @@ def openai_ask_requests(
         try:
             resp = requests.post(url, headers=headers, json=data, timeout=timeout)
 
-            # HTTP error
             if resp.status_code != 200:
                 preview = (resp.text or "").strip().replace("\n", " ")[:300]
                 raise RuntimeError(f"HTTP {resp.status_code} | {preview}")
 
-            # Safe JSON
             try:
                 payload = resp.json()
             except Exception:
@@ -153,7 +395,8 @@ def openai_ask_requests(
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_err = e
-            time.sleep(1.5 * attempt)
+            wait = 2.0 * attempt
+            time.sleep(wait)
             continue
         except RuntimeError as e:
             last_err = e
@@ -162,245 +405,470 @@ def openai_ask_requests(
                 continue
             raise
 
-    raise RuntimeError(f"OpenAI request failed after retries: {last_err}")
+    raise RuntimeError(
+        f"OpenAI request failed after {max_retries} retries: {last_err}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public LLM pipeline functions
+# ---------------------------------------------------------------------------
 
 def ask_baseline(prompt_path, hl_desc):
-	with open(prompt_path, "r") as f:
-		sys_prompt = f.read()
-	messages = [
-		{"role": "system", "content": sys_prompt}, 
-		{"role": "user", "content": hl_desc},
-	]
-	raw_response = openai_ask_requests(messages)
-	source_code = code_utils.outer_code_parse(raw_response)
-	return source_code
+    with open(prompt_path, "r") as f:
+        sys_prompt = f.read()
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": hl_desc},
+    ]
+    raw_response = openai_ask_requests(messages)
+    source_code = code_utils.outer_code_parse(raw_response)
+    return source_code
+
 
 def summarize_problem_description(prompt_path, context):
-	with open(prompt_path, "r") as f:
-		prompt = f.read()
-	messages = [
-        {"role": "system", "content": prompt}, 
-        {"role": "user", "content": context}
+    with open(prompt_path, "r") as f:
+        prompt = f.read()
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": context},
     ]
-	# Query the LLM
-	return openai_ask_requests(messages, model="o4-mini")
+    return openai_ask_requests(messages, model="o4-mini")
+
 
 def formalize_problem_description(prompt_path, hl_desc):
-	with open(prompt_path, "r") as f:
-		prompt = f.read()
-	messages = [
-        {"role": "system", "content": prompt}, 
-        {"role": "user", "content": f"# High-level problem description:\n{hl_desc}"}
+    with open(prompt_path, "r") as f:
+        prompt = f.read()
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"# High-level problem description:\n{hl_desc}"},
     ]
-	# Query the LLM
-	return openai_ask_requests(messages)
+    return openai_ask_requests(messages)
 
 
 def _define_solver(prompt, ctx):
-	solver_type = "SCIP"  # TODO: ask the LLM to set the solver type based on the problem description
-	code = """solver = define_solver("SCIP")"""
-	return "\n\n" + code
+    code = 'solver = define_solver("SCIP")'
+    return "\n\n" + code + "\n"
+
 
 def print_solution(sys_prompt, context, code, api_doc):
-	func_code = code_utils.get_function_code("log_utils.py", ["get_solution_values"])
-	code_hint = f"""The user has already implemented the optimization model. The code so far is as follows:
+    """
+    Asks the LLM to generate the solution visualization block.
+    Uses allow_undefined=True: visualization references runtime vars (solver,
+    status…) — static undefined-names check would produce false positives.
+    compile() check still runs, catching narrative-text SyntaxErrors.
+    """
+    func_code = code_utils.get_function_code("log_utils.py", ["get_solution_values"])
+    code_hint = f"""The user has already implemented the optimization model. \
+The code so far is as follows:
 
 ```python
-{code}.
+{code}
 ```
 
-You also have acces to an API documentation for the DataLoader class which loads and processes the input data. Use it when relevant:
+You also have access to an API documentation for the DataLoader class which \
+loads and processes the input data. Use it when relevant:
 
 ```python
 {api_doc}
 ```
 
-Your task is only to implement the solution visualization. To do so, you **MUST** use the function provided below:
+Your task is only to implement the solution visualization. \
+To do so, you **MUST** use the function provided below:
 
 ```python
 {func_code}
 ```
-""" 
-	messages = [
-		{"role": "system", "content": sys_prompt+code_hint}, 
-		{"role": "user", "content": context},
-	]
-	raw_response = openai_ask_requests(messages)
-	source_code = code_utils.outer_code_parse(raw_response)
-	return source_code
+
+**Strict output rules:**
+- Output ONLY valid Python code.
+- Do NOT include markdown fences (```), prose, or natural-language instructions.
+- Do NOT write lines like "Add this code right after:", "Code to insert:", etc.
+- The code will be appended directly after the existing solution; write it so \
+it executes correctly in that context without any wrapping.
+- If you need to comment something, use Python comments (#).
+"""
+    messages = [
+        {"role": "system", "content": sys_prompt + code_hint},
+        {"role": "user", "content": context},
+    ]
+    source_code = _llm_step_with_gating(
+        messages,
+        code_prefix=code,
+        allow_undefined=True,
+    )
+    return source_code
+
+
+# ---------------------------------------------------------------------------
+# Gated model-building steps
+# ---------------------------------------------------------------------------
+
+def _api_doc_guard(api_doc: str) -> str:
+    """Return an IMPORTANT block to inject when api_doc is empty."""
+    if not (api_doc or "").strip():
+        return (
+            "\nIMPORTANT:\n"
+            "- DataLoader has NO usable API for this problem (api_doc is empty).\n"
+            "- Do NOT use DataLoader at all.\n"
+            "- Extract all required numeric data directly from the problem text "
+            "and encode it as Python lists/dicts.\n"
+        )
+    return ""
+
+
+# Injected into every data-loading prompt to prevent silent int truncation.
+_FLOAT_SAFETY_RULE = (
+    "\nDATA TYPE SAFETY (CRITICAL):\n"
+    "- NEVER cast data to int or np.int64 without first verifying all values\n"
+    "  are whole numbers. Silent truncation (e.g. 2.9 → 2) corrupts coefficients.\n"
+    "- Use np.float64 as the default dtype for ALL numeric arrays loaded from CSV.\n"
+    "- Only use integer dtype when the problem explicitly guarantees integer-only\n"
+    "  values AND you have verified this in the data.\n"
+    "- If integer values are required by the model (e.g. counts), call\n"
+    "  _validate_integer_column(arr, 'column_name') before casting.\n"
+)
+
 
 def _define_variables(sys_prompt, context, code, api_doc):
-	func_code = code_utils.get_function_code("optimization_utils.py", ["define_variables"])
-	code_hint = f"""The user has already implemented part of the optimization model. The code so far is as follows:
+    func_code = code_utils.get_function_code(
+        "optimization_utils.py", ["define_variables"]
+    )
+    code_hint = f"""The user has already implemented part of the optimization \
+model. The code so far is as follows:
 
 ```python
-{code}.
+{code}
 ```
 
-You also have acces to an API documentation for the DataLoader class which loads and processes the input data. Use it when relevant:
+You also have access to an API documentation for the DataLoader class which \
+loads and processes the input data. Use it when relevant:
 
 ```python
 {api_doc}
 ```
 
-Your task is only to implement the decision variable definitions. To do so, you **MUST** use the functions provided below:
+Your task is only to implement the decision variable definitions. \
+To do so, you **MUST** use the functions provided below:
 
 ```python
 {func_code}
 ```
 
-Choose the most appropriate parameters based on the nature of the problem (e.g., binary decisions, integer allocations, indexed variables, etc.).
+Choose the most appropriate parameters based on the nature of the problem \
+(e.g., binary decisions, integer allocations, indexed variables, etc.).
 
-**Your task:**
-
+**Strict output rules:**
 * Only provide the Python code necessary to define the decision variables.
 * Follow the conventions and structure used in the existing implementation.
-* Do **not** include objective functions, constraints, or any other parts of the solution in this step.
+* Do **not** include objective functions, constraints, or any other parts.
+* Output ONLY valid Python code — no markdown fences, no prose, no instructions.
+* Your response must start on a new line and be syntactically self-contained.
 """
+    code_hint += _api_doc_guard(api_doc)
 
-	# ✅ IMPORTANT: if api_doc is empty, forbid DataLoader usage (force manual extraction from text)
+    messages = [
+        {"role": "system", "content": sys_prompt + code_hint},
+        {"role": "user", "content": context},
+    ]
+    source_code = _llm_step_with_gating(messages, code_prefix=code)
+    source_code = utils.add_type_comments(source_code)
+    return source_code
 
-	if not (api_doc or "").strip():
-		code_hint += (
-		"\nIMPORTANT:\n"
-		"- DataLoader has NO usable API for this problem (api_doc is empty).\n"
-		"- Do NOT use DataLoader at all.\n"
-		"- Extract all required numeric data directly from the problem text and encode it as Python lists/dicts.\n"
-		)
-
-	messages = [
-	{"role": "system", "content": sys_prompt + code_hint},
-	{"role": "user", "content": context},
-	]
-	raw_response = openai_ask_requests(messages)
-	source_code = code_utils.outer_code_parse(raw_response)
-	source_code = utils.add_type_comments(source_code)
-	return source_code
 
 def _define_objective(sys_prompt, context, code, api_doc):
-	func_code = code_utils.get_function_code("optimization_utils.py", ["define_linear_expr", "add_objective"])
-
-	code_hint = f"""The user has already implemented part of the optimization model. The code so far is as follows:
+    func_code = code_utils.get_function_code(
+        "optimization_utils.py", ["define_linear_expr", "add_objective"]
+    )
+    code_hint = f"""The user has already implemented part of the optimization \
+model. The code so far is as follows:
 
 ```python
-{code}.
+{code}
 ```
 
-You also have acces to an API documentation for the DataLoader class which loads and processes the input data. Use it when relevant:
+You also have access to an API documentation for the DataLoader class which \
+loads and processes the input data. Use it when relevant:
 
 ```python
 {api_doc}
 ```
 
-Your task is only to implement the objective function definitions. To do so, you **MUST** use the functions provided below:
+Your task is only to implement the objective function definitions. \
+To do so, you **MUST** use the functions provided below:
 
 ```python
 {func_code}
 ```
 
-**Your task:**  
-- Only provide the Python code necessary to define the objective function.  
+**Strict output rules:**
+- Only provide the Python code necessary to define the objective function.
 - Follow the conventions and structure used in the existing implementation.
-- Do **not** include constraints, or any other parts of the solution in this step.
-""" 
-	# ✅ IMPORTANT: if api_doc is empty, forbid DataLoader usage (force manual extraction from text)
+- Do **not** include constraints, or any other parts of the solution.
+- Output ONLY valid Python code — no markdown fences, no prose, no instructions.
+- Your response must start on a new line and be syntactically self-contained.
+"""
+    code_hint += _api_doc_guard(api_doc)
 
-	if not (api_doc or "").strip():
-		code_hint += (
-		"\nIMPORTANT:\n"
-		"- DataLoader has NO usable API for this problem (api_doc is empty).\n"
-		"- Do NOT use DataLoader at all.\n"
-		"- Extract all required numeric data directly from the problem text and encode it as Python lists/dicts.\n"
-		)
-	messages = [
-		{"role": "system", "content": sys_prompt+code_hint}, 
-		{"role": "user", "content": context},
-	]
-	raw_response = openai_ask_requests(messages)
-	source_code = code_utils.outer_code_parse(raw_response)
-	return source_code
+    messages = [
+        {"role": "system", "content": sys_prompt + code_hint},
+        {"role": "user", "content": context},
+    ]
+    source_code = _llm_step_with_gating(messages, code_prefix=code)
+    return source_code
+
 
 def _define_constraints(sys_prompt, context, code, api_doc):
-	func_code = code_utils.get_function_code("optimization_utils.py", ["define_linear_expr", "add_constraint"])
-
-	code_hint = f"""The user has already implemented part of the optimization model. The code so far is as follows:
+    func_code = code_utils.get_function_code(
+        "optimization_utils.py", ["define_linear_expr", "add_constraint"]
+    )
+    code_hint = f"""The user has already implemented part of the optimization \
+model. The code so far is as follows:
 
 ```python
-{code}.
+{code}
 ```
 
-You also have acces to an API documentation for the DataLoader class which loads and processes the input data. Use it when relevant:
+You also have access to an API documentation for the DataLoader class which \
+loads and processes the input data. Use it when relevant:
 
 ```python
 {api_doc}
 ```
 
-Your task is only to implement the constraints definitions. To do so, you **MUST** use the functions provided below:
+Your task is only to implement the constraints definitions. \
+To do so, you **MUST** use the functions provided below:
 
 ```python
 {func_code}
 ```
 
-**Your task:**  
-- Only provide the Python code necessary to define the constraints.  
+**Strict output rules:**
+- Only provide the Python code necessary to define the constraints.
 - Follow the conventions and structure used in the existing implementation.
-- Do **not** include any other parts of the solution in this step.
+- Do **not** include any other parts of the solution.
+- Output ONLY valid Python code — no markdown fences, no prose, no instructions.
+- Your response must start on a new line and be syntactically self-contained.
 """
-	# ✅ IMPORTANT: if api_doc is empty, forbid DataLoader usage (force manual extraction from text)
+    code_hint += _api_doc_guard(api_doc)
 
-	if not (api_doc or "").strip():
-		code_hint += (
-		"\nIMPORTANT:\n"
-		"- DataLoader has NO usable API for this problem (api_doc is empty).\n"
-		"- Do NOT use DataLoader at all.\n"
-		"- Extract all required numeric data directly from the problem text and encode it as Python lists/dicts.\n"
-		)
+    messages = [
+        {"role": "system", "content": sys_prompt + code_hint},
+        {"role": "user", "content": context},
+    ]
+    source_code = _llm_step_with_gating(messages, code_prefix=code)
+    return source_code
 
-	messages = [
-		{"role": "system", "content": sys_prompt+code_hint}, 
-		{"role": "user", "content": context},
-	]
-	raw_response = openai_ask_requests(messages)
-	source_code = code_utils.outer_code_parse(raw_response)
-	return source_code
 
-def implement_optimization(prompt_path, context, code_base, api_doc):
-	with open(prompt_path, "r") as f:
-		sys_prompt = f.read()
+def _regenerate_constraints_infeasible(
+    sys_prompt: str,
+    context: str,
+    code_before_constraints: str,
+    api_doc: str,
+    infeasible_stderr: str,
+    attempt: int,
+) -> str:
+    """
+    Ask the LLM to regenerate constraints after an INFEASIBLE result.
 
-	# Add the solver to the context
-	code_base += _define_solver("", None)
+    Provides the solver error output as explicit feedback so the LLM
+    understands what went wrong and can correct over-constrained formulations.
+    """
+    func_code = code_utils.get_function_code(
+        "optimization_utils.py", ["define_linear_expr", "add_constraint"]
+    )
 
-	# Add variables to the context
-	code_base += _define_variables(sys_prompt, context, code_base, api_doc)
-	
-	# Add objective to the context
-	code_base += _define_objective(sys_prompt, context, code_base, api_doc)
+    feedback_block = (
+        f"\n\n# ⚠️  INFEASIBLE FEEDBACK (attempt {attempt})\n"
+        f"# The previous constraint implementation made the model INFEASIBLE.\n"
+        f"# Solver output:\n"
+        + "\n".join(f"# {line}" for line in (infeasible_stderr or "").splitlines()[:10])
+    )
 
-	# Add constraints to the context
-	code_base += _define_constraints(sys_prompt, context, code_base, api_doc)
+    code_hint = f"""The user has already implemented part of the optimization \
+model. The code so far is as follows:
 
-	return code_base
-	
+```python
+{code_before_constraints}
+```
+
+{feedback_block}
+
+You also have access to an API documentation for the DataLoader class which \
+loads and processes the input data. Use it when relevant:
+
+```python
+{api_doc}
+```
+
+**CRITICAL: The previous constraint implementation caused an INFEASIBLE model.**
+This means the constraints were too restrictive or contradictory.
+
+Please regenerate ONLY the constraints with the following corrections:
+- Re-read the problem description carefully to identify which constraints \
+may be wrong (wrong direction ≤ vs ≥, wrong RHS value, or missing slack).
+- Make sure all equality constraints (=) are truly required; prefer \
+inequalities (≤ or ≥) where the problem allows.
+- Do NOT add constraints that are not explicitly required by the problem.
+- Verify sign conventions: a minimization model with cost ≥ 0 constraints \
+is more likely feasible than strict equalities.
+
+To implement constraints, you **MUST** use the functions provided below:
+
+```python
+{func_code}
+```
+
+**Strict output rules:**
+- Only provide the Python code necessary to define the constraints.
+- Output ONLY valid Python code — no markdown fences, no prose, no instructions.
+- Your response must start on a new line and be syntactically self-contained.
+"""
+    code_hint += _api_doc_guard(api_doc)
+
+    messages = [
+        {"role": "system", "content": sys_prompt + code_hint},
+        {"role": "user", "content": context},
+    ]
+    source_code = _llm_step_with_gating(messages, code_prefix=code_before_constraints)
+    return source_code
+
+
+def implement_optimization(
+    prompt_path: str,
+    context: str,
+    code_base: str,
+    api_doc: str,
+    max_infeasible_retries: int = 2,
+    probe_timeout: int = 60,
+) -> str:
+    """
+    Builds the full optimization code incrementally.
+
+    Pipeline:
+      1. Solver definition  (deterministic)
+      2. Decision variables (gated LLM)
+      3. Objective function (gated LLM)
+      4. Constraints        (gated LLM + INFEASIBLE retry loop)
+
+    Raises LLMPipelineError if a step cannot be completed (e.g. network failure).
+    """
+    with open(prompt_path, "r") as f:
+        sys_prompt = f.read()
+
+    # Step 1 — solver (deterministic)
+    solver_snippet = _define_solver("", None)
+    code_base = _safe_join(code_base, solver_snippet)
+
+    # Step 2 — decision variables
+    try:
+        vars_snippet = _define_variables(sys_prompt, context, code_base, api_doc)
+    except RuntimeError as e:
+        raise LLMPipelineError("variables", e) from e
+    code_base = _safe_join(code_base, vars_snippet)
+
+    # Step 3 — objective function
+    try:
+        obj_snippet = _define_objective(sys_prompt, context, code_base, api_doc)
+    except RuntimeError as e:
+        raise LLMPipelineError("objective", e) from e
+    code_base = _safe_join(code_base, obj_snippet)
+
+    # Snapshot before constraints so we can roll back on INFEASIBLE
+    code_before_constraints = code_base
+
+    # Step 4 — constraints (with INFEASIBLE retry loop)
+    last_infeasible_stderr = ""
+
+    for infeasible_attempt in range(max_infeasible_retries + 1):
+        if infeasible_attempt == 0:
+            try:
+                cst_snippet = _define_constraints(
+                    sys_prompt, context, code_before_constraints, api_doc
+                )
+            except RuntimeError as e:
+                raise LLMPipelineError("constraints", e) from e
+        else:
+            print(
+                f"\n🔁  INFEASIBLE detected — regenerating constraints "
+                f"(attempt {infeasible_attempt}/{max_infeasible_retries}) ...",
+                file=sys.stderr,
+            )
+            try:
+                cst_snippet = _regenerate_constraints_infeasible(
+                    sys_prompt=sys_prompt,
+                    context=context,
+                    code_before_constraints=code_before_constraints,
+                    api_doc=api_doc,
+                    infeasible_stderr=last_infeasible_stderr,
+                    attempt=infeasible_attempt,
+                )
+            except RuntimeError as e:
+                raise LLMPipelineError("constraints_infeasible_retry", e) from e
+
+        candidate = _safe_join(code_before_constraints, cst_snippet)
+
+        probe_code = candidate + "\nstatus = solver.Solve()\nprint('STATUS:', status)\n"
+        stdout, stderr, rc = _probe_solution(probe_code, timeout=probe_timeout)
+
+        if _is_infeasible(stdout, stderr):
+            last_infeasible_stderr = stderr or stdout
+            continue
+
+        code_base = candidate
+        break
+    else:
+        print(
+            f"\n⚠️  INFEASIBLE persists after {max_infeasible_retries} retries. "
+            f"Using last constraints; final execution may still fail.",
+            file=sys.stderr,
+        )
+        code_base = _safe_join(code_before_constraints, cst_snippet)
+
+    return code_base
+
+
+class LLMPipelineError(RuntimeError):
+    """Raised when a gated LLM step fails due to a network / API error."""
+
+    def __init__(self, step: str, cause: Exception):
+        self.step = step
+        self.cause = cause
+        super().__init__(f"LLM pipeline failed at step '{step}': {cause}")
+
+
 def data_processing(prompt_path, context):
-	with open(prompt_path, "r") as f:
-		sys_prompt = f.read()
-	messages = [
-		{"role": "system", "content": sys_prompt}, 
-		{"role": "user", "content": context},
-	]
+    """
+    Ask the LLM to generate a DataLoader class from CSV files.
 
-	raw_response = openai_ask_requests(messages)
-	source_code = code_utils.outer_code_parse(raw_response)
-	return source_code
+    After code generation, applies _patch_int_casts() to replace any
+    unsafe integer dtype casts with float64 + validation guards (Codex P2).
+    """
+    with open(prompt_path, "r") as f:
+        sys_prompt = f.read()
+
+    # Inject float safety rule into the system prompt for data loading
+    sys_prompt_patched = sys_prompt + _FLOAT_SAFETY_RULE
+
+    messages = [
+        {"role": "system", "content": sys_prompt_patched},
+        {"role": "user", "content": context},
+    ]
+    raw_response = openai_ask_requests(messages)
+    source_code = code_utils.outer_code_parse(raw_response)
+
+    # Post-process: replace int casts with float64 + inject validation guard
+    source_code = _patch_int_casts(source_code)
+
+    return source_code
+
 
 def write_report(prompt_path, context, summary):
-	with open(prompt_path, "r") as f:
-		sys_prompt = f.read()
-	messages = [
-		{"role": "system", "content": sys_prompt}, 
-		{"role": "user", "content": context+summary},
-	]
-	
-	raw_response = openai_ask_requests(messages)
-	return raw_response
+    with open(prompt_path, "r") as f:
+        sys_prompt = f.read()
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": context + summary},
+    ]
+    raw_response = openai_ask_requests(messages)
+    return raw_response

@@ -24,6 +24,17 @@ PROMPT_DIR = "prompts"
 # --- Parse objective value from optim_summary.txt ---
 OBJ_RE = re.compile(r"Optimization objective value:\s*([+-]?\d+(?:\.\d+)?)")
 
+# ---------------------------------------------------------------------------
+# Timeout configuration (seconds)
+# ---------------------------------------------------------------------------
+# Per-problem timeout for the full pipeline subprocess (LLM calls + solver).
+# Increase if your LLM calls are slow.  600 s = 10 min per problem.
+BATCH_PROBLEM_TIMEOUT: int = 600
+
+# Timeout for solution.py execution only (solver run).
+# Most LP/MIP problems should solve in under 2 min.  Set higher for hard MIPs.
+SOLUTION_TIMEOUT: int = 120
+
 
 # ----------------------------
 # Console formatting helpers
@@ -166,6 +177,7 @@ def batch_run(
     verbosity: int = 1,
     dry_run: bool = False,
     report_path: str = "batch_results.csv",
+    problem_timeout: int = BATCH_PROBLEM_TIMEOUT,
 ):
     dataset_dir = os.path.join(data_root, dataset_name)
     if not os.path.isdir(dataset_dir):
@@ -208,6 +220,7 @@ def batch_run(
                     f"Mode:    {_mode_str(all_flag, single_id, ids_csv, range_pair, start, limit)}",
                     f"Root:    {problems_root}",
                     f"Total:   {len(selected_ids)} problem(s)",
+                    f"Timeout: {problem_timeout}s per problem",
                 ],
             )
         )
@@ -262,7 +275,7 @@ def batch_run(
 
         if verbosity > 0:
             print(_hr())
-            print(f"[{idx}/{total}] ▶ Running {problem_folder}")
+            print(f"[{idx}/{total}] ▶ Running {problem_folder}  (timeout {problem_timeout}s)")
             print(_hr())
 
         cmd = [
@@ -275,23 +288,50 @@ def batch_run(
             "-v",
             str(verbosity),
         ]
-        run = subprocess.run(cmd)
+
+        # ---------------------------------------------------------------
+        # Run with timeout so a hanging solver or LLM call never blocks
+        # the entire batch.
+        # ---------------------------------------------------------------
+        timed_out = False
+        try:
+            run = subprocess.run(cmd, timeout=problem_timeout)
+            returncode = run.returncode
+        except subprocess.TimeoutExpired as e:
+            # Kill the entire process group so no zombie solver lingers
+            timed_out = True
+            returncode = -1
+            if verbosity > 0:
+                print(
+                    f"\n⏱  TIMEOUT — {problem_folder} exceeded {problem_timeout}s, killing.",
+                    file=sys.stderr,
+                )
+            # Write a synthetic optim_summary so the error appears in the CSV
+            optim_path_early = os.path.join(problem_path, "optim_summary.txt")
+            with open(optim_path_early, "w", encoding="utf-8") as f:
+                f.write(
+                    f"\n\n[stderr]\n"
+                    f"TIMEOUT: problem exceeded {problem_timeout}s and was killed.\n"
+                )
 
         optim_path = os.path.join(problem_path, "optim_summary.txt")
         objective = extract_objective_value(optim_path)
 
         ok = None
-        status = "OK"
-        if run.returncode != 0:
+        if timed_out:
+            status = "TIMEOUT"
+        elif returncode != 0:
             status = "RUN_FAILED"
         elif objective is None:
             status = "NO_OBJECTIVE"
-        elif expected is not None:
-            try:
-                exp_f = float(expected)
-                ok = abs(objective - exp_f) <= tolerance
-            except Exception:
-                status = "BAD_EXPECTED_FORMAT"
+        else:
+            status = "OK"
+            if expected is not None:
+                try:
+                    exp_f = float(expected)
+                    ok = abs(objective - exp_f) <= tolerance
+                except Exception:
+                    status = "BAD_EXPECTED_FORMAT"
 
         short_err = None
         if os.path.exists(optim_path):
@@ -339,10 +379,11 @@ def batch_run(
 
     passed = sum(1 for r in results if r.get("ok") is True)
     comparable = sum(1 for r in results if r.get("ok") is not None)
+    timeouts = sum(1 for r in results if r.get("status") == "TIMEOUT")
 
     print(_hr())
     print(f"✅ Report saved: {report_path}")
-    print(f"📊 Comparable: {comparable} | Passed: {passed} | Total: {len(results)}")
+    print(f"📊 Comparable: {comparable} | Passed: {passed} | Timeouts: {timeouts} | Total: {len(results)}")
 
 
 def build_api_doc():
@@ -361,7 +402,14 @@ def build_api_doc():
     return document_public_api(DataLoader)
 
 
-def run_solution(problem_path, code):
+def run_solution(problem_path, code, timeout: int = SOLUTION_TIMEOUT):
+    """
+    Write solution.py, copy dependencies, and execute it.
+
+    The subprocess is given `timeout` seconds.  If it exceeds that limit
+    (e.g. an INFEASIBLE/unbounded solver spinning forever), it is killed and
+    a non-zero returncode is returned so the caller propagates RUN_FAILED.
+    """
     output_file_path = os.path.join(problem_path, "solution.py")
     with open(output_file_path, "w", encoding="utf-8") as f:
         f.write(code)
@@ -374,14 +422,29 @@ def run_solution(problem_path, code):
     if os.path.exists("data.py"):
         shutil.move("data.py", os.path.join(problem_path, "data.py"))
 
-    results = subprocess.run(
-        [sys.executable, "solution.py"],
-        cwd=problem_path,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True,
-    )
-    return results
+    try:
+        result = subprocess.run(
+            [sys.executable, "solution.py"],
+            cwd=problem_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=timeout,
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        # Return a synthetic CompletedProcess so callers don't need to change
+        msg = (
+            f"TIMEOUT: solution.py exceeded {timeout}s and was killed. "
+            f"The solver may have been stuck on an INFEASIBLE or unbounded model."
+        )
+        print(f"\n⏱  {msg}", file=sys.stderr)
+        return subprocess.CompletedProcess(
+            args=[sys.executable, "solution.py"],
+            returncode=1,
+            stdout="",
+            stderr=msg,
+        )
 
 
 def run_baseline(problem_path, high_level_description):
@@ -441,7 +504,8 @@ def main(args):
     with SpinnerManager("Refining and formalizing the problem ...", active=args.verbosity > 0):
         sys_prompt_path = os.path.join(PROMPT_DIR, "system_prompt_problem_summary.txt")
         complete_description = llm_utils.summarize_problem_description(
-            sys_prompt_path, high_level_description + "\n\n" + csv_files_summary + "\n\n" + refinement
+            sys_prompt_path,
+            high_level_description + "\n\n" + csv_files_summary + "\n\n" + refinement,
         )
 
     # DATA EXTRACTION
@@ -456,8 +520,14 @@ def main(args):
     if has_csv_file:
         with SpinnerManager("Now I need to extract and prepare the data...", active=args.verbosity > 0):
             sys_prompt_path = os.path.join(PROMPT_DIR, "system_prompt_dataloader.txt")
-            input_files_description, has_csv_file = io_utils.convert_file_to_json(problem_path, complete_description)
-            context = complete_description + "\n\n" + csv_files_summary + "\n\n" + input_files_description
+            input_files_description, has_csv_file = io_utils.convert_file_to_json(
+                problem_path, complete_description
+            )
+            context = (
+                complete_description
+                + "\n\n" + csv_files_summary
+                + "\n\n" + input_files_description
+            )
 
             code_data = llm_utils.data_processing(sys_prompt_path, context)
 
@@ -483,7 +553,21 @@ def main(args):
         if has_csv_file:
             context += "\n\n" + csv_files_summary + "\n\n" + input_files_description
 
-        code_optimization = llm_utils.implement_optimization(sys_prompt_path, context, code_base, api_doc)
+        # -------------------------------------------------------------------
+        # Catch LLMPipelineError (network timeout mid-pipeline) so the batch
+        # runner marks this problem as RUN_FAILED instead of crashing.
+        # -------------------------------------------------------------------
+        try:
+            code_optimization = llm_utils.implement_optimization(
+                sys_prompt_path, context, code_base, api_doc
+            )
+        except llm_utils.LLMPipelineError as e:
+            # Write a minimal optim_summary so the batch layer can read stderr
+            optim_summary_path = os.path.join(problem_path, "optim_summary.txt")
+            with open(optim_summary_path, "w", encoding="utf-8") as f:
+                f.write(f"\n\n[stderr]\nLLMPipelineError at step '{e.step}': {e.cause}\n")
+            print(f"\n⚠️  LLM pipeline failed at step '{e.step}': {e.cause}", file=sys.stderr)
+            sys.exit(1)
 
     # SOLUTION RENDERING
     with SpinnerManager("Almost there ! Just missing the final touch now ...", active=args.verbosity > 0):
@@ -491,9 +575,19 @@ def main(args):
         code_summary = code_utils.add_print_summary()
         solution_code = code_optimization + code_summary
 
-        code_print = llm_utils.print_solution(
-            sys_prompt_path, complete_description + "\n\n" + csv_files_summary, solution_code, api_doc
-        )
+        # print_solution is non-critical: if it times out, we skip the pretty
+        # printer but keep the rest of the solution intact.
+        try:
+            code_print = llm_utils.print_solution(
+                sys_prompt_path,
+                complete_description + "\n\n" + csv_files_summary,
+                solution_code,
+                api_doc,
+            )
+        except RuntimeError as e:
+            print(f"\n⚠️  print_solution LLM call failed ({e}), skipping pretty printer.",
+                  file=sys.stderr)
+            code_print = "pass  # print_solution skipped due to LLM error\n"
 
         # Wrap print_solution to avoid crashing after Solve() / objective print
         wrapped_print = (
@@ -513,7 +607,10 @@ def main(args):
             print(f"   - {fx}")
         print()
 
-    optim_summary = run_solution(problem_path, solution_code)
+    # Run solution with timeout (catches hung solvers)
+    solution_timeout = getattr(args, "solution_timeout", SOLUTION_TIMEOUT)
+    optim_summary = run_solution(problem_path, solution_code, timeout=solution_timeout)
+
     optim_summary_path = os.path.join(problem_path, "optim_summary.txt")
     with open(optim_summary_path, "w", encoding="utf-8") as f:
         f.write(optim_summary.stdout)
@@ -530,7 +627,9 @@ def main(args):
 
     if args.verbosity > 1:
         sys_prompt_path = os.path.join(PROMPT_DIR, "system_prompt_write_report.txt")
-        report = llm_utils.write_report(sys_prompt_path, complete_description, optim_summary.stdout)
+        report = llm_utils.write_report(
+            sys_prompt_path, complete_description, optim_summary.stdout
+        )
         report_path = os.path.join(problem_path, "report.txt")
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(report)
@@ -552,6 +651,12 @@ if __name__ == "__main__":
         default=PROBLEM_BASE_DIR,
         help="Root directory containing problem folders for single runs.",
     )
+    parser.add_argument(
+        "--solution-timeout",
+        type=int,
+        default=SOLUTION_TIMEOUT,
+        help=f"Max seconds for solution.py execution (default: {SOLUTION_TIMEOUT}s).",
+    )
 
     # --- Batch ---
     p_batch = sub.add_parser("batch", help="Run a batch from a dataset JSONL.")
@@ -570,6 +675,12 @@ if __name__ == "__main__":
     p_batch.add_argument("--dry-run", action="store_true")
     p_batch.add_argument("--tolerance", type=float, default=1e-6)
     p_batch.add_argument("--report", default="batch_results.csv")
+    p_batch.add_argument(
+        "--problem-timeout",
+        type=int,
+        default=BATCH_PROBLEM_TIMEOUT,
+        help=f"Max seconds for the full per-problem pipeline (default: {BATCH_PROBLEM_TIMEOUT}s).",
+    )
 
     args = parser.parse_args()
 
@@ -589,6 +700,7 @@ if __name__ == "__main__":
             verbosity=args.verbosity,
             dry_run=args.dry_run,
             report_path=args.report,
+            problem_timeout=args.problem_timeout,
         )
     else:
         if not args.fname:
