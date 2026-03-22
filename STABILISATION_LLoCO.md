@@ -12,13 +12,14 @@ python3 main.py batch --dataset IndustryOR --all
 
 En réduisant :
 
-- Les RUN_FAILED (NameError, SyntaxError, AttributeError)
+- Les RUN_FAILED (NameError, SyntaxError, AttributeError, ValueError)
 - Les NO_OBJECTIVE
 - Les erreurs dues à des variables inventées par le LLM
 - Les utilisations incorrectes de DataLoader
 - Les crashs de pipeline liés aux timeouts réseau
 - Les SyntaxError dues à une mauvaise concaténation des blocs de code
 - Les modèles INFEASIBLE générés par le LLM
+- Les erreurs runtime dues à des dépendances de données non respectées entre étapes
 
 ---
 
@@ -467,6 +468,93 @@ Les modèles INFEASIBLE déclenchent une régénération ciblée des contraintes
 
 ---
 
+### 3.10 Détection des erreurs runtime d'ordre de définition et retry objectif
+
+**Fichier modifié :** `llm_utils.py`  
+**Nouvelles fonctions :** `_is_runtime_value_error`, `_regenerate_objective_runtime_error`  
+**Fonction modifiée :** `implement_optimization`
+
+#### Problème
+
+```
+ValueError: Distance matrix D (7x7) must be defined before adding the objective.
+```
+
+Observé sur IndustryOR_60. Le LLM générait une fonction objectif qui référençait une matrice `D` ou d'autres données qui n'avaient pas encore été définies dans `code_base` au moment de l'étape objectif. Ces erreurs ne sont pas des erreurs de syntaxe (le gating statique ne les voit pas) ni des erreurs INFEASIBLE — elles surviennent à l'**exécution du code généré** car le LLM a généré une garde `ValueError` qui vérifie la présence de données nécessaires.
+
+#### Cause
+
+L'étape objectif ne bénéficiait d'aucun probe à l'exécution. Seules les contraintes étaient testées via `_probe_solution`. Le `_llm_step_with_gating` vérifie `compile()` et les undefined names statiques, mais ne détecte pas les `ValueError` levées à l'exécution.
+
+#### Solution
+
+**a) `_is_runtime_value_error(stdout, stderr)`** — détecte les `ValueError` et messages d'ordre de définition :
+
+```python
+_RUNTIME_VALUE_ERROR_PATTERNS = re.compile(
+    r"(ValueError|must\s+be\s+defined\s+before|not\s+defined\s+before"
+    r"|has\s+not\s+been\s+initialized|missing\s+required\s+data"
+    r"|cannot\s+be\s+used\s+before)",
+    re.IGNORECASE,
+)
+```
+
+Ne se déclenche pas sur INFEASIBLE ni SyntaxError.
+
+**b) `_regenerate_objective_runtime_error(...)`** — prompt spécialisé avec feedback explicite :
+
+```
+CRITICAL: The previous objective implementation caused a runtime error.
+- Define ALL required data (matrices, cost vectors, etc.) inline at the top
+  of your snippet, BEFORE using them in the objective expression.
+- Do NOT assume any variable exists unless visible in the "code so far" block.
+- If data comes from DataLoader, load it explicitly using the DataLoader API.
+```
+
+**c) Boucle runtime retry dans `implement_optimization`** — insérée entre step 2 (variables) et step 4 (contraintes) :
+
+```
+Step 3 — objectif
+  ├─ _define_objective (gated LLM)
+  ├─ _probe_solution (tmpdir isolé, timeout=60s)
+  ├─ ValueError / RuntimeError détecté ?
+  │    └─ retry (max 2) → _regenerate_objective_runtime_error avec feedback
+  │         └─ _probe_solution again
+  ├─ Toujours en erreur après retries ?
+  │    └─ utilise quand même (pipeline continue)
+  └─ Sinon : accepte l'objectif → passe aux contraintes (step 4)
+```
+
+**d) Nouveau paramètre configurable** :
+
+```python
+def implement_optimization(
+    ...,
+    max_infeasible_retries: int = 2,
+    max_runtime_retries: int = 2,   # ← nouveau
+    probe_timeout: int = 60,
+) -> str:
+```
+
+#### Validation
+
+Tests unitaires `_is_runtime_value_error` (6/6 ✅) :
+
+```
+✅ ValueError: Distance matrix D (7x7) must be defined before...  = True
+✅ ValueError: variable x has not been initialized                 = True
+✅ must be defined before adding the objective                     = True
+✅ STATUS: 0  (solution valide)                                    = False
+✅ MPSOLVER_INFEASIBLE                                             = False
+✅ SyntaxError: invalid syntax                                     = False
+```
+
+#### Impact
+
+Les erreurs de type "donnée non définie avant utilisation dans l'objectif" déclenchent une régénération ciblée de l'étape objectif avec feedback explicite. Le pipeline couvre maintenant les erreurs runtime à **toutes les étapes critiques**. ✅ **Validé**
+
+---
+
 ## 4) Résultat observé — pipeline technique ✅ STABILISÉ
 
 Toutes les catégories d'erreurs techniques du pipeline ont été traitées et validées :
@@ -480,6 +568,7 @@ Toutes les catégories d'erreurs techniques du pipeline ont été traitées et v
 | `RuntimeError` timeout réseau LLM | ✅ Éliminé (`LLMPipelineError` + catch) |
 | Batch bloqué indéfiniment | ✅ Éliminé (timeout `subprocess.run`) |
 | `MPSOLVER_INFEASIBLE` | ✅ Traité (probe + retry ciblé contraintes) |
+| `ValueError` dépendance données objectif | ✅ Traité (probe + retry ciblé objectif) |
 
 ---
 
@@ -523,6 +612,9 @@ Ces points relèvent de l'amélioration des prompts et de la qualité d'extracti
 | `llm_utils.py` | `_probe_solution()` — exécution isolée dans tmpdir avant écriture finale | 3.9 |
 | `llm_utils.py` | `_regenerate_constraints_infeasible()` — prompt spécialisé avec feedback solver | 3.9 |
 | `llm_utils.py` | `implement_optimization` : boucle INFEASIBLE retry avec snapshot contraintes | 3.9 |
+| `llm_utils.py` | `_is_runtime_value_error()` — détection ValueError / dépendance données | 3.10 |
+| `llm_utils.py` | `_regenerate_objective_runtime_error()` — prompt spécialisé runtime error objectif | 3.10 |
+| `llm_utils.py` | `implement_optimization` : boucle runtime retry objectif + `max_runtime_retries` | 3.10 |
 | `main.py` | Catch `LLMPipelineError` → `RUN_FAILED` propre sans crash batch | 3.6 |
 | `main.py` | Catch `RuntimeError` sur `print_solution` → fallback `pass` | 3.6 |
 | `main.py` | `BATCH_PROBLEM_TIMEOUT` / `SOLUTION_TIMEOUT` — constantes configurables | 3.8 |
@@ -544,6 +636,7 @@ Le pipeline LLoCO est désormais **techniquement stabilisé à 100%** :
 - ✅ Texte narratif généré par le LLM filtré avant compilation
 - ✅ Blocs de code toujours séparés proprement (`_safe_join`)
 - ✅ Modèles INFEASIBLE traités par retry ciblé sur les contraintes avec feedback
+- ✅ Erreurs de dépendance de données dans l'objectif traitées par retry ciblé avec feedback
 - ✅ Tous les échecs sont capturés, loggés et visibles dans `batch_results.csv`
 
 Les erreurs restantes sont exclusivement des questions de **qualité de modélisation** (prompts, extraction de données), et non plus des bugs techniques du pipeline.

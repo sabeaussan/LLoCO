@@ -215,6 +215,27 @@ def _is_infeasible(stdout: str, stderr: str) -> bool:
     return bool(_INFEASIBLE_PATTERNS.search(combined))
 
 
+# Patterns that indicate a runtime ValueError / data dependency error in
+# generated code (e.g. "must be defined before", "not defined", "missing").
+_RUNTIME_VALUE_ERROR_PATTERNS = re.compile(
+    r"(ValueError|must\s+be\s+defined\s+before|not\s+defined\s+before"
+    r"|has\s+not\s+been\s+initialized|missing\s+required\s+data"
+    r"|cannot\s+be\s+used\s+before)",
+    re.IGNORECASE,
+)
+
+
+def _is_runtime_value_error(stdout: str, stderr: str) -> bool:
+    """
+    Return True if the probe output indicates a runtime ValueError caused by
+    missing data / wrong ordering (e.g. objective referencing D before it is
+    defined).  These errors come from the LLM-generated code itself, not the
+    solver, so they require regenerating the offending step.
+    """
+    combined = (stdout or "") + (stderr or "")
+    return bool(_RUNTIME_VALUE_ERROR_PATTERNS.search(combined))
+
+
 def _probe_solution(code: str, timeout: int = 60) -> tuple[str, str, int]:
     """
     Run `code` in an isolated temp directory and return (stdout, stderr, returncode).
@@ -734,12 +755,90 @@ To implement constraints, you **MUST** use the functions provided below:
     return source_code
 
 
+def _regenerate_objective_runtime_error(
+    sys_prompt: str,
+    context: str,
+    code_before_objective: str,
+    api_doc: str,
+    runtime_stderr: str,
+    attempt: int,
+) -> str:
+    """
+    Ask the LLM to regenerate the objective function after a runtime ValueError.
+
+    This handles cases where the LLM generates objective code that references
+    data (e.g. a distance matrix D) that has not yet been defined at that point
+    in the accumulated code.  The feedback tells the LLM to define all required
+    data inline before using it.
+    """
+    func_code = code_utils.get_function_code(
+        "optimization_utils.py", ["define_linear_expr", "add_objective"]
+    )
+
+    feedback_block = (
+        f"\n\n# ⚠️  RUNTIME ERROR FEEDBACK (attempt {attempt})\n"
+        f"# The previous objective implementation raised a RuntimeError/ValueError.\n"
+        f"# This usually means the code referenced data or variables that were not\n"
+        f"# yet defined at the point where the objective was built.\n"
+        f"# Error output:\n"
+        + "\n".join(f"# {line}" for line in (runtime_stderr or "").splitlines()[:10])
+    )
+
+    code_hint = f"""The user has already implemented part of the optimization \
+model. The code so far is as follows:
+
+```python
+{code_before_objective}
+```
+
+{feedback_block}
+
+You also have access to an API documentation for the DataLoader class which \
+loads and processes the input data. Use it when relevant:
+
+```python
+{api_doc}
+```
+
+**CRITICAL: The previous objective implementation caused a runtime error.**
+The code referenced data (e.g. a matrix, a list, a coefficient) that was not \
+yet defined.
+
+Please regenerate ONLY the objective function with the following corrections:
+- Define ALL required data (matrices, cost vectors, etc.) inline at the top of \
+your snippet, BEFORE using them in the objective expression.
+- Do NOT assume any variable exists unless it is visible in the "code so far" block.
+- If data comes from DataLoader, load it explicitly using the DataLoader API.
+- Use ONLY already-defined identifiers, or define them BEFORE first use.
+
+To implement the objective, you **MUST** use the functions provided below:
+
+```python
+{func_code}
+```
+
+**Strict output rules:**
+- Only provide the Python code necessary to define the objective function.
+- Output ONLY valid Python code — no markdown fences, no prose, no instructions.
+- Your response must start on a new line and be syntactically self-contained.
+"""
+    code_hint += _api_doc_guard(api_doc)
+
+    messages = [
+        {"role": "system", "content": sys_prompt + code_hint},
+        {"role": "user", "content": context},
+    ]
+    source_code = _llm_step_with_gating(messages, code_prefix=code_before_objective)
+    return source_code
+
+
 def implement_optimization(
     prompt_path: str,
     context: str,
     code_base: str,
     api_doc: str,
     max_infeasible_retries: int = 2,
+    max_runtime_retries: int = 2,
     probe_timeout: int = 60,
 ) -> str:
     """
@@ -748,8 +847,14 @@ def implement_optimization(
     Pipeline:
       1. Solver definition  (deterministic)
       2. Decision variables (gated LLM)
-      3. Objective function (gated LLM)
+      3. Objective function (gated LLM + runtime error retry loop)
       4. Constraints        (gated LLM + INFEASIBLE retry loop)
+
+    After step 3, the accumulated code is probed in a sandbox to catch
+    runtime ValueErrors caused by data dependencies (e.g. objective
+    referencing a matrix that was not yet defined).
+
+    After step 4, the probe detects INFEASIBLE models and retries constraints.
 
     Raises LLMPipelineError if a step cannot be completed (e.g. network failure).
     """
@@ -767,12 +872,59 @@ def implement_optimization(
         raise LLMPipelineError("variables", e) from e
     code_base = _safe_join(code_base, vars_snippet)
 
-    # Step 3 — objective function
-    try:
-        obj_snippet = _define_objective(sys_prompt, context, code_base, api_doc)
-    except RuntimeError as e:
-        raise LLMPipelineError("objective", e) from e
-    code_base = _safe_join(code_base, obj_snippet)
+    # Step 3 — objective function (with runtime error retry loop)
+    # Snapshot before objective so we can roll back on runtime error.
+    code_before_objective = code_base
+    last_runtime_stderr = ""
+
+    for runtime_attempt in range(max_runtime_retries + 1):
+        if runtime_attempt == 0:
+            try:
+                obj_snippet = _define_objective(
+                    sys_prompt, context, code_before_objective, api_doc
+                )
+            except RuntimeError as e:
+                raise LLMPipelineError("objective", e) from e
+        else:
+            print(
+                f"\n🔁  Runtime error in objective — regenerating "
+                f"(attempt {runtime_attempt}/{max_runtime_retries}) ...",
+                file=sys.stderr,
+            )
+            try:
+                obj_snippet = _regenerate_objective_runtime_error(
+                    sys_prompt=sys_prompt,
+                    context=context,
+                    code_before_objective=code_before_objective,
+                    api_doc=api_doc,
+                    runtime_stderr=last_runtime_stderr,
+                    attempt=runtime_attempt,
+                )
+            except RuntimeError as e:
+                raise LLMPipelineError("objective_runtime_retry", e) from e
+
+        obj_candidate = _safe_join(code_before_objective, obj_snippet)
+
+        # Probe: run up to and including the objective (no Solve yet).
+        # We only need to check that the code doesn't raise at build time.
+        probe_code = obj_candidate + "\n# probe: objective defined OK\n"
+        stdout, stderr, rc = _probe_solution(probe_code, timeout=probe_timeout)
+
+        if _is_runtime_value_error(stdout, stderr):
+            last_runtime_stderr = stderr or stdout
+            continue  # retry objective with feedback
+
+        # No runtime error — accept objective and move on
+        code_base = obj_candidate
+        break
+    else:
+        # Retries exhausted — use last generated objective anyway
+        print(
+            f"\n⚠️  Runtime error in objective persists after {max_runtime_retries} retries. "
+            f"Using last objective; final execution may still fail.",
+            file=sys.stderr,
+        )
+        code_base = _safe_join(code_before_objective, obj_snippet)
 
     # Snapshot before constraints so we can roll back on INFEASIBLE
     code_before_constraints = code_base
