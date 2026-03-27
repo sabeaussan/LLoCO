@@ -361,38 +361,38 @@ def openai_ask_requests(
     - readable error messages (HTTP + preview)
     - automatic retry (timeout / 429 / 5xx)
     """
+    if model=="gpt-5":
+        api_key = os.environ.get("OPENAI_API_KEY")
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            for fname in [".api_key.txt", "api_key.txt"]:
+                path = os.path.join(os.getcwd(), fname)
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        api_key = f.read().strip()
+                    break
 
-    if not api_key:
-        for fname in [".api_key.txt", "api_key.txt"]:
-            path = os.path.join(os.getcwd(), fname)
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    api_key = f.read().strip()
-                break
+        if not api_key:
+            raise RuntimeError(
+                "API key not found (.api_key.txt / api_key.txt / OPENAI_API_KEY)."
+            )
 
-    if not api_key:
-        raise RuntimeError(
-            "API key not found (.api_key.txt / api_key.txt / OPENAI_API_KEY)."
+        url = (
+            f"https://cld.akkodis.com/api/openai/deployments/models-{model}"
+            f"/chat/completions?api-version=2024-12-01-preview"
         )
 
-    url = (
-        f"https://cld.akkodis.com/api/openai/deployments/models-{model}"
-        f"/chat/completions?api-version=2024-12-01-preview"
-    )
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "api-key": api_key,
+        }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-        "api-key": api_key,
-    }
-
-    data = {
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }
-
+        data = {
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+    else:
     if response_format is not None:
         data["response_format"] = response_format
 
