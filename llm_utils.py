@@ -351,8 +351,9 @@ def openai_ask_requests(
     model="gpt-5",
     response_format=None,
     max_tokens=10000,
-    timeout=90,
+    timeout=7200,
     max_retries=4,
+    test=False
 ):
     """
     Robust wrapper:
@@ -361,7 +362,7 @@ def openai_ask_requests(
     - readable error messages (HTTP + preview)
     - automatic retry (timeout / 429 / 5xx)
     """
-    if model=="gpt-5":
+    if test:
         api_key = os.environ.get("OPENAI_API_KEY")
 
         if not api_key:
@@ -393,6 +394,23 @@ def openai_ask_requests(
             "messages": messages,
         }
     else:
+        base_url = os.environ.get("LLAMA_SERVER_URL", "http://localhost:8080")
+
+        url = f"{base_url}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+
+        for m in messages:
+            if m["role"] == "system":
+                m["content"] = ( "IMPORTANT : Whenn you give python code, you must use a Markdown bloc as follow:\n```python\n<code here>\n```\n\n" ) + m["content"]
+            break
+
+        data = {
+            "models": "Qwen2.5-7B-Instruct-Q8_0.gguf",
+            "messages": messages,
+            "max_tokens": 500,
+            "temperature": 0.2
+        }
+
     if response_format is not None:
         data["response_format"] = response_format
 

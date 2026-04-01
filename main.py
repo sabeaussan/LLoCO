@@ -651,7 +651,7 @@ if __name__ == "__main__":
         default=PROBLEM_BASE_DIR,
         help="Root directory containing problem folders for single runs.",
     )
-    parser.add_argument(
+    parser.add_argument( "-t",
         "--solution-timeout",
         type=int,
         default=SOLUTION_TIMEOUT,
