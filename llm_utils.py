@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -454,7 +455,7 @@ def summarize_problem_description(prompt_path, context):
         {"role": "system", "content": prompt},
         {"role": "user", "content": context},
     ]
-    return openai_ask_requests(messages, model="o4-mini")
+    return openai_ask_requests(messages, model="gpt-5")
 
 
 def formalize_problem_description(prompt_path, hl_desc):
@@ -622,6 +623,15 @@ To do so, you **MUST** use the functions provided below:
 {func_code}
 ```
 
+**CRITICAL — Optimization direction (maximize vs minimize):**
+- Read the problem statement **very carefully** to determine whether to \
+MAXIMIZE or MINIMIZE.
+- Profit, revenue, production output, number of items → `maximize=True`
+- Cost, time, distance, waste, penalty, expense → `maximize=False`
+- If the problem says "minimize the total cost", you MUST use `maximize=False`.
+- If the problem says "maximize the profit", you MUST use `maximize=True`.
+- Do NOT guess — find the explicit objective direction in the problem text.
+
 **Strict output rules:**
 - Only provide the Python code necessary to define the objective function.
 - Follow the conventions and structure used in the existing implementation.
@@ -663,6 +673,28 @@ To do so, you **MUST** use the functions provided below:
 ```python
 {func_code}
 ```
+
+**CRITICAL — Constraint completeness:**
+- Re-read the mathematical formulation carefully and list ALL constraints \
+before writing code.
+- Include: capacity constraints, demand constraints, variable bounds, \
+logical constraints, and any other constraint mentioned in the problem.
+- Do NOT skip constraints that seem "obvious" — the solver needs them all.
+- Do NOT add constraints that are not in the problem statement.
+
+**Strict vs non-strict inequalities (eps_relax):**
+- For strict inequalities (< or >), you MUST set `eps_relax` to a small \
+positive value in `add_constraint`. Otherwise the strict inequality is \
+silently treated as non-strict (≤ or ≥).
+- For integer variables: `eps_relax=1` (e.g., x < y becomes x <= y - 1).
+- For continuous variables: `eps_relax=0.0001` or appropriate to the scale.
+- For non-strict inequalities (≤, ≥) or equalities (=): leave `eps_relax=0.0`.
+
+**Constraint direction:**
+- `operator.le` means ≤ (less than or equal).
+- `operator.ge` means ≥ (greater than or equal).
+- `operator.eq` means = (equality).
+- Double-check the direction of EACH constraint against the problem text.
 
 **Strict output rules:**
 - Only provide the Python code necessary to define the constraints.
@@ -832,6 +864,66 @@ To implement the objective, you **MUST** use the functions provided below:
     return source_code
 
 
+# ---------------------------------------------------------------------------
+# Direction validation (maximize vs minimize)
+# ---------------------------------------------------------------------------
+
+_MAXIMIZE_RE = re.compile(r"add_objective\s*\([^)]*maximize\s*=\s*(True|False)", re.IGNORECASE)
+
+_DIRECTION_CHECK_PROMPT = """You are an Operations Research expert. Your ONLY task is to verify whether the optimization direction is correct.
+
+Problem description:
+{context}
+
+The generated code uses: `add_objective(..., maximize={current_direction})`
+
+Question: Based on the problem description, should the objective be MAXIMIZED or MINIMIZED?
+
+Answer with EXACTLY one word: MAXIMIZE or MINIMIZE. Nothing else."""
+
+
+def _check_objective_direction(context: str, obj_snippet: str) -> Optional[str]:
+    """
+    Ask the LLM to verify the objective direction.
+    Returns "MAXIMIZE", "MINIMIZE", or None if unable to determine.
+    """
+    match = _MAXIMIZE_RE.search(obj_snippet)
+    if not match:
+        return None  # cannot determine current direction from code
+
+    current_direction = match.group(1)  # "True" or "False"
+
+    messages = [
+        {
+            "role": "user",
+            "content": _DIRECTION_CHECK_PROMPT.format(
+                context=context[:3000],  # truncate to save tokens
+                current_direction=current_direction,
+            ),
+        }
+    ]
+
+    try:
+        answer = openai_ask_requests(messages, max_tokens=10, timeout=30)
+        answer = answer.strip().upper()
+        if "MAXIMIZE" in answer:
+            return "MAXIMIZE"
+        if "MINIMIZE" in answer:
+            return "MINIMIZE"
+        return None
+    except Exception:
+        return None
+
+
+def _flip_objective_direction(obj_snippet: str) -> str:
+    """Flip maximize=True to maximize=False and vice versa."""
+    def _flip(m):
+        val = m.group(1)
+        new_val = "False" if val == "True" else "True"
+        return m.group(0).replace(f"maximize={val}", f"maximize={new_val}")
+    return _MAXIMIZE_RE.sub(_flip, obj_snippet)
+
+
 def implement_optimization(
     prompt_path: str,
     context: str,
@@ -916,6 +1008,27 @@ def implement_optimization(
 
         # No runtime error — accept objective and move on
         code_base = obj_candidate
+
+        # Step 3b — direction validation (maximize vs minimize)
+        match = _MAXIMIZE_RE.search(obj_snippet)
+        if match:
+            current_is_max = match.group(1) == "True"
+            verdict = _check_objective_direction(context, obj_snippet)
+            if verdict == "MAXIMIZE" and not current_is_max:
+                print(
+                    "\n🔄  Direction mismatch: code says minimize but problem says maximize. Flipping.",
+                    file=sys.stderr,
+                )
+                obj_snippet = _flip_objective_direction(obj_snippet)
+                code_base = _safe_join(code_before_objective, obj_snippet)
+            elif verdict == "MINIMIZE" and current_is_max:
+                print(
+                    "\n🔄  Direction mismatch: code says maximize but problem says minimize. Flipping.",
+                    file=sys.stderr,
+                )
+                obj_snippet = _flip_objective_direction(obj_snippet)
+                code_base = _safe_join(code_before_objective, obj_snippet)
+
         break
     else:
         # Retries exhausted — use last generated objective anyway

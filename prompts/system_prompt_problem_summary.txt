@@ -12,6 +12,12 @@ Use your OR skills to define a rigorous and formal mathematical model of the und
 
 **Objective function**: What is the user trying to optimize ? Should we minimize or maximize ? Does it needs to be formalized as mutliple objective functions ?
 
-**Constraints**: What are the constraints of the problem ? How do they relate to the decision variables ? Make sure to include physical constraints (i.e can a variable be negative for instance ?), practical constraints (is the production/capacity limited in anyway ?) and user specified (for e.g, budget or preference). 
+**Constraints**: What are the constraints of the problem ? How do they relate to the decision variables ? Make sure to include physical constraints (i.e can a variable be negative for instance ?), practical constraints (is the production/capacity limited in anyway ?) and user specified (for e.g, budget or preference). List ALL constraints — do not skip any, even if they seem obvious.
+
+**Numeric data extraction**: Extract and explicitly list ALL numeric coefficients, parameters, and constants from the problem statement. This includes:
+- Values from tables, lists, or inline numbers
+- Costs, capacities, demands, rates, limits, bounds
+- Matrix-shaped data (e.g., distance tables, assignment costs)
+Present them clearly so the implementation step can directly use them without re-reading the problem text.
 
 DO NOT include low-level details such as python libraries, specific solvers or implementation-specific information.

@@ -1,13 +1,15 @@
-# Journal de modifications — Stabilisation LLoCO (IndustryOR)
+# Journal de modifications — Stabilisation LLoCO (IndustryOR, ComplexOR, LPWP)
 
 ---
 
 ## 1) Objectif du travail
 
-Stabiliser l'exécution batch :
+Stabiliser l'exécution batch et étendre le support à tous les formats de datasets :
 
 ```bash
 python3 main.py batch --dataset IndustryOR --all
+python3 main.py batch --dataset ComplexOR --all
+python3 main.py batch --dataset LPWP --all
 ```
 
 En réduisant :
@@ -555,6 +557,141 @@ Les erreurs de type "donnée non définie avant utilisation dans l'objectif" dé
 
 ---
 
+### 3.11 Support multi-format datasets (ComplexOR, LPWP)
+
+**Fichier modifié :** `main.py`  
+**Nouvelles fonctions :** `detect_dataset_format`, `load_subdir_dataset`, `_build_en_question`, `_subdir_id`  
+**Nouveau dataclass :** `DatasetFormat`  
+**Fonction modifiée :** `batch_run`
+
+#### Problème
+
+Le batch runner ne supportait que le format IndustryOR (un seul fichier JSONL avec tous les problèmes). Les autres datasets (ComplexOR, LPWP) utilisent un format différent : un répertoire par problème, chacun contenant `description.txt` (énoncé) et `sample.json` (données d'entrée + réponse attendue).
+
+**IndustryOR (format existant) :**
+```
+datasets/IndustryOR/IndustryOR.json     ← JSONL, 1 ligne = 1 problème
+  {"en_question": "...", "en_answer": "219816.0", "id": 1}
+```
+
+**ComplexOR (nouveau format) :**
+```
+datasets/ComplexOR/
+  ├── aircraft_assignment/
+  │   ├── description.txt     ← énoncé du problème
+  │   └── sample.json         ← {"input": {...}, "output": [valeur]}
+  ├── diet_problem/
+  │   ├── description.txt
+  │   └── sample.json
+  └── ...                     ← 18 sous-dossiers
+```
+
+**LPWP (nouveau format) :**
+```
+datasets/LPWP/
+  ├── prob_0/
+  │   ├── description.txt
+  │   └── sample.json
+  ├── prob_1/
+  └── ...                     ← 288 sous-dossiers
+```
+
+#### Solution
+
+**a) `DatasetFormat` — dataclass de détection :**
+
+```python
+@dataclass
+class DatasetFormat:
+    kind: str              # "jsonl" ou "subdirs"
+    jsonl_path: str        # chemin du .json (si kind == "jsonl")
+    sub_dirs: List[str]    # liste triée des sous-dossiers (si kind == "subdirs")
+```
+
+**b) `detect_dataset_format(dataset_dir)`** — détection automatique :
+
+- Si un seul fichier `.json` existe à la racine du dataset → format JSONL (IndustryOR)
+- Sinon, cherche les sous-dossiers contenant `description.txt` + `sample.json` → format subdirs
+- Lève `ValueError` si aucun format n'est reconnu
+
+**c) `load_subdir_dataset(dataset_dir, sub_dirs)`** — conversion vers le format interne :
+
+Pour chaque sous-dossier :
+1. Lit `description.txt` → texte de description
+2. Lit `sample.json` → extrait `input` (données) et `output` (réponse)
+3. Construit `en_question` = description + données d'entrée formatées en JSON
+4. Construit `en_answer` = valeur de `output` (scalaire)
+5. Ajoute `source_dir` = nom du sous-dossier d'origine
+
+Le `user_input.md` généré ne contient **jamais** la réponse attendue (`output`).
+
+**d) `_subdir_id(name, index)`** — attribution d'ID numériques :
+
+- Pour LPWP (`prob_42`) → extrait `42` du nom
+- Pour ComplexOR (`diet_problem`) → utilise l'index 1-based dans la liste triée
+
+**e) `batch_run` mis à jour :**
+
+- Utilise `detect_dataset_format()` au lieu de `find_single_json_file()` hardcodé
+- Affiche `source_dir` dans l'interface CLI (ex. `ComplexOR_7  (diet_problem)`)
+- Inclut `source_dir` dans `batch_results.csv` pour traçabilité
+
+#### Validation
+
+```bash
+# ComplexOR — 18 problèmes détectés, dry-run OK
+$ python3 main.py batch --dataset ComplexOR --all --dry-run
+╭──────────────────────────────╮
+│  🚀 LLoCO Batch Runner       │
+│  Dataset: ComplexOR          │
+│  Source:  18 subdirectories  │
+│  Mode:    --all              │
+│  Total:   18 problem(s)      │
+╰──────────────────────────────╯
+[1/18] 🧪 DRY_RUN ComplexOR_1
+...
+[18/18] 🧪 DRY_RUN ComplexOR_18
+
+# LPWP — 288 problèmes détectés, sélection par ID
+$ python3 main.py batch --dataset LPWP --id 0 --dry-run
+[1/1] 🧪 DRY_RUN LPWP_0
+
+# IndustryOR — pipeline inchangé, toujours fonctionnel
+$ python3 main.py batch --dataset IndustryOR --id 1 --dry-run
+[1/1] 🧪 DRY_RUN IndustryOR_1
+```
+
+**Contenu vérifié de `user_input.md` (LPWP_0) :**
+```
+A fishery wants to transport their catch. They can either use local sled
+dogs or trucks. [...]
+
+Input data:
+​```json
+{
+  "DogCapability": 100,
+  "TruckCapability": 300,
+  "DogCost": 50,
+  "TruckCost": 100,
+  "MaxBudget": 1000
+}
+​```
+```
+→ Pas de `output` / `en_answer` dans le fichier. ✅
+
+**Contenu vérifié de `batch_results.csv` :**
+```csv
+id,folder,source_dir,expected,objective,ok,status
+0,LPWP_0,prob_0,1300,,,DRY_RUN
+```
+→ `source_dir` tracé correctement. ✅
+
+#### Impact
+
+Le batch runner supporte désormais les trois datasets sans modification du pipeline existant. La détection du format est automatique — aucun flag supplémentaire n'est nécessaire. ✅ **Validé**
+
+---
+
 ## 4) Résultat observé — pipeline technique ✅ STABILISÉ
 
 Toutes les catégories d'erreurs techniques du pipeline ont été traitées et validées :
@@ -569,28 +706,159 @@ Toutes les catégories d'erreurs techniques du pipeline ont été traitées et v
 | Batch bloqué indéfiniment | ✅ Éliminé (timeout `subprocess.run`) |
 | `MPSOLVER_INFEASIBLE` | ✅ Traité (probe + retry ciblé contraintes) |
 | `ValueError` dépendance données objectif | ✅ Traité (probe + retry ciblé objectif) |
+| Datasets non-JSONL (ComplexOR, LPWP) | ✅ Supporté (détection auto + conversion interne) |
 
 ---
 
-## 5) Travail restant (qualité modèle)
+## 5) Améliorations qualité modèle (prompts & extraction)
 
-Les FAILED restants ne sont plus des erreurs techniques — ils relèvent exclusivement de la qualité de modélisation :
+Les FAILED restants ne sont plus des erreurs techniques — ils relevaient exclusivement de la qualité de modélisation. Les améliorations suivantes ont été apportées :
 
-- Sens Min/Max incorrect dans l'objectif
-- Contraintes manquantes ou partiellement extraites
-- Extraction imprécise des coefficients depuis l'énoncé
-- Modèles INFEASIBLE persistants après retry (sur-contraints structurellement)
+### 5.1 Correction direction Min/Max (objectif)
 
-Ces points relèvent de l'amélioration des prompts et de la qualité d'extraction des données.
+**Fichiers modifiés :** `optimization_utils.py`, `llm_utils.py`
+
+- **Docstring `add_objective` corrigée** : le paramètre s'appelait `direction` dans la doc mais `maximize` dans le code. La docstring liste maintenant explicitement quand utiliser `maximize=True` vs `maximize=False` avec des exemples (profit → True, cost → False).
+- **Prompt `_define_objective` enrichi** : bloc CRITICAL ajouté qui force le LLM à identifier le sens d'optimisation dans l'énoncé avant de coder. Exemples explicites : "minimize the total cost" → `maximize=False`.
+
+#### Impact attendu
+
+Réduction des erreurs de direction d'optimisation — premier poste d'erreurs restant.
+
+### 5.2 Guidance contraintes complètes + eps_relax
+
+**Fichier modifié :** `llm_utils.py`
+
+- **Prompt `_define_constraints` enrichi** avec trois blocs :
+  1. **Constraint completeness** : demande au LLM de lister TOUTES les contraintes de la formalisation avant de coder. Interdit de sauter les contraintes "évidentes".
+  2. **Strict vs non-strict inequalities** : explique le piège `eps_relax=0.0` (< silencieusement traité comme ≤). Donne les valeurs recommandées : `eps_relax=1` pour entiers, `eps_relax=0.0001` pour continus.
+  3. **Constraint direction** : rappel explicite de `operator.le` (≤), `operator.ge` (≥), `operator.eq` (=).
+
+#### Impact attendu
+
+Réduction des contraintes manquantes et des erreurs de direction de contrainte.
+
+### 5.3 Formalisation sur modèle complet (gpt-5)
+
+**Fichier modifié :** `llm_utils.py`
+
+- `summarize_problem_description` passé de `o4-mini` à `gpt-5`. L'étape de formalisation mathématique est critique — une mauvaise formulation propage des erreurs dans tout le pipeline.
+
+#### Impact attendu
+
+Meilleure qualité des formalisations mathématiques, en particulier sur les problèmes complexes multi-contraintes.
+
+### 5.4 Worked example dans le system prompt code
+
+**Fichier modifié :** `prompts/system_prompt_code_.txt`
+
+- Ajout d'un exemple complet de résolution (problème de production à 2 produits) montrant le pattern exact : extraction données → `define_variables` → `define_linear_expr` → `add_objective` → `add_constraint`.
+- Section "Key takeaways" récapitulant les conventions à suivre.
+
+#### Impact attendu
+
+Le LLM a un modèle concret à suivre au lieu de deviner le pattern d'utilisation de la bibliothèque.
+
+### 5.5 Extraction explicite des coefficients numériques
+
+**Fichier modifié :** `prompts/system_prompt_problem_summary.txt`
+
+- Nouveau bloc "Numeric data extraction" dans le prompt de formalisation. Demande au LLM d'extraire et lister explicitement TOUS les coefficients, paramètres et constantes (valeurs des tableaux, coûts, capacités, taux, limites, bornes, matrices).
+
+#### Impact attendu
+
+Réduction des erreurs d'extraction de coefficients depuis les tableaux et textes d'énoncé.
+
+### 5.6 Réactivation `add_type_comments` (annotations numpy)
+
+**Fichier modifié :** `utils.py`
+
+- L'ancien `TypeCommentInserter` basé sur `libcst` était désactivé (no-op) et avait un bug sur les tuples shapes.
+- Remplacement complet par une approche regex robuste (`_DEFVAR_RE`) qui :
+  1. Détecte chaque appel `var = define_variables(solver, shape=..., ...)`
+  2. Injecte un commentaire `# IMPORTANT: var is a numpy array (dtype=object) of OR-Tools decision variables with shape=...`
+  3. Rappelle d'utiliser `.flatten()` pour obtenir un array 1-D pour `define_linear_expr`
+- Suppression de la dépendance `libcst` (import `re` suffit)
+- Fonctionne avec tous les formats de shape : `(3,)`, `5`, `(4, 3)`, `num_items`
+
+#### Impact attendu
+
+Le LLM sait que `define_variables` retourne un numpy array et connaît sa shape, ce qui réduit les erreurs de manipulation (indexation, reshape, flatten).
+
+### 5.7 Probe de validation direction min/max post-objectif
+
+**Fichier modifié :** `llm_utils.py`  
+**Nouvelles fonctions :** `_check_objective_direction`, `_flip_objective_direction`  
+**Nouveau regex :** `_MAXIMIZE_RE`
+
+- Après que l'objectif passe le runtime check, un appel LLM léger (`max_tokens=10`) vérifie si la direction `maximize=True/False` dans le code généré est cohérente avec l'énoncé du problème.
+- Le LLM répond par un seul mot : `MAXIMIZE` ou `MINIMIZE`.
+- Si incohérence détectée, `_flip_objective_direction` inverse automatiquement `maximize=True` ↔ `maximize=False` via regex.
+- Le flip est loggé dans stderr pour traçabilité.
+- En cas d'erreur réseau ou de réponse ambiguë, la direction originale est conservée (fail-safe).
+
+#### Flux dans `implement_optimization` :
+
+```
+Step 3 — objectif
+  ├─ _define_objective (gated LLM)
+  ├─ _probe_solution (runtime check)
+  ├─ Step 3b — _check_objective_direction (LLM léger, 10 tokens)
+  │    ├─ Cohérent → continue
+  │    └─ Incohérent → _flip_objective_direction → log + continue
+  └─ Passe aux contraintes (step 4)
+```
+
+#### Impact attendu
+
+Détection et correction automatique des erreurs de direction min/max — premier poste d'erreurs de qualité modèle.
+
+### 5.8 Injection `code_example.py` pour ComplexOR/LPWP
+
+**Fichier modifié :** `main.py`  
+**Fonctions modifiées :** `_build_en_question`, `load_subdir_dataset`
+
+- Les datasets ComplexOR et LPWP contiennent un fichier `code_example.py` par problème avec :
+  - La signature de fonction (noms et types des paramètres)
+  - Un docstring décrivant chaque paramètre
+  - La valeur de retour attendue (qui révèle souvent la direction : "minimized total cost", "maximized profit")
+- `load_subdir_dataset` lit `code_example.py` s'il existe et le passe à `_build_en_question`.
+- Le stub est ajouté en fin de `user_input.md` avec la mention explicite "for reference only — do NOT call this function, use the optimization library instead".
+
+#### Exemple de `user_input.md` généré (ComplexOR/diet_problem) :
+
+```
+Consider a diet problem. [...]
+
+Input data:
+​```json
+{"food_set": ["Apple", "Banana"], ...}
+​```
+
+Function signature and parameter descriptions (for reference only — do NOT call
+this function, use the optimization library instead):
+​```python
+def diet_problem(food_set, nutrient_set, food_cost, ...):
+    """
+    Args:
+        food_set: List of strings, each representing a type of food.
+        ...
+    Returns:
+        total_cost: The minimized total cost to satisfy the nutrient requirements.
+    """
+​```
+```
+
+#### Impact attendu
+
+Le LLM dispose des noms exacts des paramètres, de leurs types et de la direction d'optimisation attendue, ce qui réduit les erreurs de modélisation sur les datasets ComplexOR/LPWP.
 
 ---
 
 ## 6) Recommandations futures
 
-- Améliorer les prompts pour réduire les erreurs Min/Max (exemples de sens d'optimisation dans le system prompt)
 - Étendre `_regenerate_constraints_infeasible` avec un parser d'énoncé pour identifier automatiquement les contraintes suspectes
 - Ajouter logs d'audit du code généré (`generated_code_log.txt` par problème) pour faciliter le débogage qualité modèle
-- Étendre `_strip_narrative_lines` si de nouveaux patterns narratifs sont détectés en production
 - Envisager un retry complet (variables + objectif + contraintes) sur INFEASIBLE persistant après les retries contraintes seules
 
 ---
@@ -624,6 +892,27 @@ Ces points relèvent de l'amélioration des prompts et de la qualité d'extracti
 | `main.py` | Résumé batch enrichi avec compteur `Timeouts` | 3.8 |
 | `code_utils.py` | `List[str] \| None` → `Optional[List[str]]` | 3.3 |
 | `code_utils.py` | Restauration de `sanitize_python()` | 3.4 |
+| `main.py` | `DatasetFormat` dataclass — détection format JSONL vs subdirs | 3.11 |
+| `main.py` | `detect_dataset_format()` — auto-détection du format dataset | 3.11 |
+| `main.py` | `load_subdir_dataset()` — chargement ComplexOR/LPWP en format interne | 3.11 |
+| `main.py` | `_build_en_question()` — construction description + input JSON | 3.11 |
+| `main.py` | `_subdir_id()` — attribution ID numériques (prob_N → N, sinon index) | 3.11 |
+| `main.py` | `batch_run` : détection auto via `detect_dataset_format()` | 3.11 |
+| `main.py` | `batch_run` : affichage `source_dir` dans CLI et `batch_results.csv` | 3.11 |
+| `optimization_utils.py` | Docstring `add_objective` : `direction` → `maximize`, exemples min/max | 5.1 |
+| `llm_utils.py` | Prompt `_define_objective` : bloc CRITICAL direction maximize/minimize | 5.1 |
+| `llm_utils.py` | Prompt `_define_constraints` : blocs completeness, eps_relax, direction | 5.2 |
+| `llm_utils.py` | `summarize_problem_description` : `o4-mini` → `gpt-5` | 5.3 |
+| `prompts/system_prompt_code_.txt` | Worked example complet (pattern define_variables → add_objective → add_constraint) | 5.4 |
+| `prompts/system_prompt_problem_summary.txt` | Bloc "Numeric data extraction" — extraction explicite coefficients | 5.5 |
+| `utils.py` | `add_type_comments` réécrit en regex — annotations numpy shape sur `define_variables` | 5.6 |
+| `utils.py` | Suppression dépendance `libcst`, remplacement par `_DEFVAR_RE` | 5.6 |
+| `llm_utils.py` | `_check_objective_direction()` — appel LLM léger pour vérifier direction | 5.7 |
+| `llm_utils.py` | `_flip_objective_direction()` — inversion automatique maximize ↔ minimize | 5.7 |
+| `llm_utils.py` | `_MAXIMIZE_RE` — regex détection `add_objective(..., maximize=...)` | 5.7 |
+| `llm_utils.py` | `implement_optimization` step 3b — direction validation post-objectif | 5.7 |
+| `main.py` | `_build_en_question` — paramètre optionnel `code_example` | 5.8 |
+| `main.py` | `load_subdir_dataset` — lecture et injection de `code_example.py` | 5.8 |
 
 ---
 
@@ -637,6 +926,11 @@ Le pipeline LLoCO est désormais **techniquement stabilisé à 100%** :
 - ✅ Blocs de code toujours séparés proprement (`_safe_join`)
 - ✅ Modèles INFEASIBLE traités par retry ciblé sur les contraintes avec feedback
 - ✅ Erreurs de dépendance de données dans l'objectif traitées par retry ciblé avec feedback
-- ✅ Tous les échecs sont capturés, loggés et visibles dans `batch_results.csv`
+- ✅ Support multi-format : IndustryOR (JSONL), ComplexOR (subdirs), LPWP (subdirs) — détection automatique
+- ✅ Tous les échecs sont capturés, loggés et visibles dans `batch_results.csv` (avec `source_dir`)
 
-Les erreurs restantes sont exclusivement des questions de **qualité de modélisation** (prompts, extraction de données), et non plus des bugs techniques du pipeline.
+Les erreurs de qualité de modélisation (direction min/max, contraintes manquantes, extraction de coefficients) sont désormais adressées par :
+- Améliorations ciblées des prompts et de la documentation API (sections 5.1–5.5)
+- Annotations numpy automatiques sur les variables de décision (section 5.6)
+- Validation automatique de la direction d'optimisation via probe LLM (section 5.7)
+- Injection des signatures et descriptions de paramètres des datasets ComplexOR/LPWP (section 5.8)
