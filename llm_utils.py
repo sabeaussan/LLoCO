@@ -455,7 +455,7 @@ def summarize_problem_description(prompt_path, context):
         {"role": "system", "content": prompt},
         {"role": "user", "content": context},
     ]
-    return openai_ask_requests(messages, model="gpt-5")
+    return openai_ask_requests(messages, model="gpt-5", timeout=180)
 
 
 def formalize_problem_description(prompt_path, hl_desc):
