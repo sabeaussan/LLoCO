@@ -8,6 +8,7 @@ import subprocess
 import csv
 import textwrap
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
 import llm_utils
@@ -816,7 +817,7 @@ if __name__ == "__main__":
     p_batch.add_argument("--overwrite", action="store_true")
     p_batch.add_argument("--dry-run", action="store_true")
     p_batch.add_argument("--tolerance", type=float, default=1e-6)
-    p_batch.add_argument("--report", default="batch_results.csv")
+    p_batch.add_argument("--report", default=None, help="Output CSV path (default: batch_results_<dataset>_<date>.csv)")
     p_batch.add_argument(
         "--problem-timeout",
         type=int,
@@ -827,6 +828,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.cmd == "batch":
+        report_path = args.report
+        if report_path is None:
+            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = f"batch_results_{args.dataset}_{date_str}.csv"
+
         batch_run(
             dataset_name=args.dataset,
             data_root=args.data_root,
@@ -841,7 +847,7 @@ if __name__ == "__main__":
             tolerance=args.tolerance,
             verbosity=args.verbosity,
             dry_run=args.dry_run,
-            report_path=args.report,
+            report_path=report_path,
             problem_timeout=args.problem_timeout,
         )
     else:
