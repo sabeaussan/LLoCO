@@ -1,5 +1,5 @@
 __pycache__/
 .api_key.txt
 .DS_Store
-batch_results.csv
+batch_results*.csv
 problems/
