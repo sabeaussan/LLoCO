@@ -60,7 +60,7 @@ def print_batch_header(dataset_name, format_label, mode_label, problems_root, to
             "🚀 LLoCO Batch Runner",
             [
                 f"Dataset: {dataset_name}",
-                f"JSON:    {format_label}",
+                f"Source:  {format_label}",
                 f"Mode:    {mode_label}",
                 f"Root:    {problems_root}",
                 f"Total:   {total} problem(s)",
@@ -88,7 +88,8 @@ def print_batch_timeout(problem_folder, problem_timeout):
     )
 
 
-def print_batch_result(status, ok, problem_folder, expected, objective, optim_path, short_err=None):
+def print_batch_result(status, ok, problem_folder, expected, objective, optim_path,
+                       short_err=None, source_dir=None):
     if status == "OK" and ok is True:
         head = "✅ PASSED"
     elif status == "OK" and ok is False:
@@ -98,7 +99,8 @@ def print_batch_result(status, ok, problem_folder, expected, objective, optim_pa
     else:
         head = f"⚠️ {status}"
 
-    print(f"\n{head} — {problem_folder}")
+    src_label = f"  ({source_dir})" if source_dir else ""
+    print(f"\n{head} — {problem_folder}{src_label}")
     print(f"   ├─ Expected:  {expected}")
     print(f"   ├─ Objective: {objective}")
     if short_err:

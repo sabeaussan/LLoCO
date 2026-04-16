@@ -91,12 +91,16 @@ def add_objective(solver, expr, maximize=True):
 			The solver instance which will contain the decision variables and solution.
 		expr : 1-D numpy array
 			1-D numpy array of linear term composing the objective function.
-		direction : bool
-			Whether we should we maximize or minimize the objective.
-		
+		maximize : bool
+			If True, the solver will MAXIMIZE the objective.
+			If False, the solver will MINIMIZE the objective.
+			**Read the problem statement carefully to choose the correct direction:**
+			- Profit, revenue, production output → typically maximize=True
+			- Cost, time, distance, waste → typically maximize=False
+
 		Returns
     	-------
-		None. The constraint is added to the solver in-place.
+		None. The objective is added to the solver in-place.
 
 		Raises
 		------
@@ -106,7 +110,10 @@ def add_objective(solver, expr, maximize=True):
 		Examples
     	--------
 			objective_expr = define_linear_expr(decision_variables, weights)
+			# Minimizing total cost:
 			add_objective(solver, objective_expr, maximize=False)
+			# Maximizing total profit:
+			add_objective(solver, objective_expr, maximize=True)
 	"""
 	# Remove potential extra axes of length one
 	if expr.ndim != 1:

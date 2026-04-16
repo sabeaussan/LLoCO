@@ -8,6 +8,7 @@ import subprocess
 import csv
 import textwrap
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
 import llm_utils
@@ -61,6 +62,138 @@ def iter_jsonl(path: str):
             if not line:
                 continue
             yield line_no, json.loads(line)
+
+
+# ---------------------------------------------------------------------------
+# Dataset format detection & conversion
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DatasetFormat:
+    """Describes the detected format of a dataset directory."""
+    kind: str  # "jsonl" or "subdirs"
+    jsonl_path: Optional[str] = None  # set when kind == "jsonl"
+    sub_dirs: Optional[List[str]] = None  # sorted list of problem sub-directories
+
+
+def detect_dataset_format(dataset_dir: str) -> DatasetFormat:
+    """
+    Detect whether a dataset uses a single JSONL file (IndustryOR style)
+    or subdirectories with description.txt + sample.json (ComplexOR / LPWP style).
+    """
+    json_files = [p for p in os.listdir(dataset_dir) if p.lower().endswith(".json")]
+    # A single top-level .json that is a *file* (not a dir) → JSONL format
+    if len(json_files) == 1 and os.path.isfile(os.path.join(dataset_dir, json_files[0])):
+        return DatasetFormat(kind="jsonl", jsonl_path=os.path.join(dataset_dir, json_files[0]))
+
+    # Look for subdirectories that contain description.txt + sample.json
+    sub_dirs = sorted(
+        d
+        for d in os.listdir(dataset_dir)
+        if os.path.isdir(os.path.join(dataset_dir, d))
+        and os.path.isfile(os.path.join(dataset_dir, d, "description.txt"))
+        and os.path.isfile(os.path.join(dataset_dir, d, "sample.json"))
+    )
+    if sub_dirs:
+        return DatasetFormat(kind="subdirs", sub_dirs=sub_dirs)
+
+    raise ValueError(
+        f"Cannot detect dataset format in {dataset_dir}. "
+        "Expected either a single .json file or subdirectories with description.txt + sample.json."
+    )
+
+
+def _build_en_question(
+    description: str, input_data: dict, code_example: Optional[str] = None
+) -> str:
+    """
+    Combine the textual description with the concrete input parameters
+    to form a complete problem statement (like IndustryOR's en_question).
+    Optionally includes a code_example.py stub for parameter/return hints.
+    """
+    parts = [description.strip()]
+    parts.append("\n\nInput data:\n```json")
+    parts.append(json.dumps(input_data, indent=2, ensure_ascii=False))
+    parts.append("```")
+    if code_example:
+        parts.append(
+            "\n\nFunction signature and parameter descriptions "
+            "(for reference only — do NOT call this function, "
+            "use the optimization library instead):\n```python"
+        )
+        parts.append(code_example.strip())
+        parts.append("```")
+    return "\n".join(parts)
+
+
+def _subdir_id(name: str, index: int) -> int:
+    """
+    Derive a numeric id from a subdirectory name.
+    For LPWP-style names like 'prob_42', extract 42.
+    Otherwise use the 1-based index in the sorted list.
+    """
+    m = re.match(r"^prob_(\d+)$", name)
+    if m:
+        return int(m.group(1))
+    return index
+
+
+def load_subdir_dataset(
+    dataset_dir: str, sub_dirs: List[str]
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """
+    Load a subdirectory-based dataset into the same (id, obj) format used
+    by iter_jsonl.  Each obj has: en_question, en_answer, source_dir.
+    """
+    problems: List[Tuple[int, Dict[str, Any]]] = []
+
+    for idx, dirname in enumerate(sub_dirs, start=1):
+        dirpath = os.path.join(dataset_dir, dirname)
+
+        with open(os.path.join(dirpath, "description.txt"), "r", encoding="utf-8") as f:
+            description = f.read()
+
+        with open(os.path.join(dirpath, "sample.json"), "r", encoding="utf-8") as f:
+            samples = json.load(f)
+
+        if not isinstance(samples, list) or len(samples) == 0:
+            continue
+
+        sample = samples[0]
+        input_data = sample.get("input", {})
+        output_val = sample.get("output", None)
+
+        # Read code_example.py if present (parameter/return hints)
+        code_example_path = os.path.join(dirpath, "code_example.py")
+        code_example = None
+        if os.path.isfile(code_example_path):
+            with open(code_example_path, "r", encoding="utf-8") as f:
+                code_example = f.read()
+
+        # Normalise output to a single scalar string (like IndustryOR's en_answer)
+        if isinstance(output_val, list) and len(output_val) == 1:
+            en_answer = str(output_val[0])
+        elif isinstance(output_val, list):
+            en_answer = str(output_val)
+        elif output_val is not None:
+            en_answer = str(output_val)
+        else:
+            en_answer = None
+
+        pid = _subdir_id(dirname, idx)
+        problems.append(
+            (
+                pid,
+                {
+                    "en_question": _build_en_question(description, input_data, code_example),
+                    "en_answer": en_answer,
+                    "source_dir": dirname,
+                    "id": pid,
+                },
+            )
+        )
+
+    return problems
 
 
 def safe_rmtree(path: str):
@@ -144,22 +277,28 @@ def batch_run(
     dry_run: bool = False,
     report_path: str = "batch_results.csv",
     problem_timeout: int = BATCH_PROBLEM_TIMEOUT,
+    solution_timeout: int = SOLUTION_TIMEOUT,
 ):
     dataset_dir = os.path.join(data_root, dataset_name)
     if not os.path.isdir(dataset_dir):
         raise FileNotFoundError(f"Dataset dir not found: {dataset_dir}")
 
-    json_path = find_single_json_file(dataset_dir)
+    fmt = detect_dataset_format(dataset_dir)
 
     problems: List[Tuple[int, Dict[str, Any]]] = []
-    for line_no, obj in iter_jsonl(json_path):
-        if "en_question" not in obj:
-            continue
-        pid = obj.get("id", line_no)
-        problems.append((pid, obj))
+    if fmt.kind == "jsonl":
+        for line_no, obj in iter_jsonl(fmt.jsonl_path):
+            if "en_question" not in obj:
+                continue
+            pid = obj.get("id", line_no)
+            problems.append((pid, obj))
+        format_label = fmt.jsonl_path
+    else:
+        problems = load_subdir_dataset(dataset_dir, fmt.sub_dirs)
+        format_label = f"{len(fmt.sub_dirs)} subdirectories"
 
     if not problems:
-        raise ValueError(f"No entries with 'en_question' found in {json_path}")
+        raise ValueError(f"No problems found in {dataset_dir}")
 
     available_ids = [pid for pid, _ in problems]
     selected_ids = select_problem_ids(
@@ -179,7 +318,7 @@ def batch_run(
     if verbosity > 0:
         print_batch_header(
             dataset_name=dataset_name,
-            format_label=json_path,
+            format_label=format_label,
             mode_label=mode_str(all_flag, single_id, ids_csv, range_pair, start, limit),
             problems_root=problems_root,
             total=len(selected_ids),
@@ -195,6 +334,7 @@ def batch_run(
                 {
                     "id": pid,
                     "folder": None,
+                    "source_dir": None,
                     "expected": None,
                     "objective": None,
                     "ok": None,
@@ -223,6 +363,7 @@ def batch_run(
                 {
                     "id": pid,
                     "folder": problem_folder,
+                    "source_dir": obj.get("source_dir"),
                     "expected": expected,
                     "objective": None,
                     "ok": None,
@@ -243,6 +384,8 @@ def batch_run(
             problem_folder,
             "--problems-root",
             problems_root,
+            "--solution-timeout",
+            str(solution_timeout),
             "-v",
             str(verbosity),
         ]
@@ -300,6 +443,7 @@ def batch_run(
             {
                 "id": pid,
                 "folder": problem_folder,
+                "source_dir": obj.get("source_dir"),
                 "expected": expected,
                 "objective": objective,
                 "ok": ok,
@@ -308,10 +452,13 @@ def batch_run(
         )
 
         if verbosity > 0:
-            print_batch_result(status, ok, problem_folder, expected, objective, optim_path, short_err)
+            print_batch_result(
+                status, ok, problem_folder, expected, objective, optim_path,
+                short_err=short_err, source_dir=obj.get("source_dir"),
+            )
 
     with open(report_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["id", "folder", "expected", "objective", "ok", "status"])
+        w = csv.DictWriter(f, fieldnames=["id", "folder", "source_dir", "expected", "objective", "ok", "status"])
         w.writeheader()
         w.writerows(results)
 
@@ -610,17 +757,28 @@ if __name__ == "__main__":
     p_batch.add_argument("--overwrite", action="store_true")
     p_batch.add_argument("--dry-run", action="store_true")
     p_batch.add_argument("--tolerance", type=float, default=1e-6)
-    p_batch.add_argument("--report", default="batch_results.csv")
+    p_batch.add_argument("--report", default=None, help="Output CSV path (default: batch_results_<dataset>_<date>.csv)")
     p_batch.add_argument(
         "--problem-timeout",
         type=int,
         default=BATCH_PROBLEM_TIMEOUT,
         help=f"Max seconds for the full per-problem pipeline (default: {BATCH_PROBLEM_TIMEOUT}s).",
     )
+    p_batch.add_argument(
+        "--solution-timeout",
+        type=int,
+        default=SOLUTION_TIMEOUT,
+        help=f"Max seconds for solution.py execution (default: {SOLUTION_TIMEOUT}s).",
+    )
 
     args = parser.parse_args()
 
     if args.cmd == "batch":
+        report_path = args.report
+        if report_path is None:
+            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_path = f"batch_results_{args.dataset}_{date_str}.csv"
+
         batch_run(
             dataset_name=args.dataset,
             data_root=args.data_root,
@@ -635,8 +793,9 @@ if __name__ == "__main__":
             tolerance=args.tolerance,
             verbosity=args.verbosity,
             dry_run=args.dry_run,
-            report_path=args.report,
+            report_path=report_path,
             problem_timeout=args.problem_timeout,
+            solution_timeout=args.solution_timeout,
         )
     else:
         if not args.fname:

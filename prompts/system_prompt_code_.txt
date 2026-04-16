@@ -18,6 +18,51 @@ All code must **strictly use** the provided optimization library.
   * Avoid paragraph explanations or verbose inline commentary.
   * Maintain excellent code readability with **descriptive variable names** and clean structure.
 
+## **Worked Example (pattern to follow):**
+
+Below is a minimal but complete example showing the correct usage pattern of the optimization library. **Follow this structure exactly** for your implementation.
+
+**Problem:** A factory produces two products (A, B). Product A yields $5 profit, product B yields $8. The factory has 40 hours of labor and 30 units of material. Product A requires 2 hours and 1 unit of material. Product B requires 4 hours and 3 units of material. Maximize total profit.
+
+```python
+import numpy as np
+
+# --- Data extraction from problem statement ---
+profits = np.array([5.0, 8.0])       # A=$5, B=$8
+labor_coeff = np.array([2.0, 4.0])   # hours per unit
+material_coeff = np.array([1.0, 3.0]) # material per unit
+labor_limit = 40.0
+material_limit = 30.0
+
+# --- Decision variables ---
+# x[0] = units of A, x[1] = units of B (continuous, non-negative)
+x = define_variables(solver, shape=(2,), lbs=[0, 0], ubs=[None, None],
+                     integer=False, suffix="product")
+
+# --- Objective: MAXIMIZE total profit ---
+obj_expr = define_linear_expr(x, profits)
+add_objective(solver, obj_expr, maximize=True)  # maximize=True because we maximize profit
+
+# --- Constraints ---
+# Labor: 2*x_A + 4*x_B <= 40
+labor_expr = define_linear_expr(x, labor_coeff)
+add_constraint(solver, labor_expr, c_val=labor_limit, c_operator=operator.le,
+               c_name="labor_limit")
+
+# Material: 1*x_A + 3*x_B <= 30
+material_expr = define_linear_expr(x, material_coeff)
+add_constraint(solver, material_expr, c_val=material_limit, c_operator=operator.le,
+               c_name="material_limit")
+```
+
+**Key takeaways from this example:**
+- Extract ALL numeric data from the problem as Python lists/arrays FIRST.
+- Use `define_variables` to create decision variables (returns a numpy array).
+- Use `define_linear_expr` to build 1-D linear expressions (x * weights).
+- Use `add_objective` with the correct `maximize=True/False` direction.
+- Use `add_constraint` with `operator.le` / `operator.ge` / `operator.eq`.
+- For strict inequalities (< or >), set `eps_relax` accordingly.
+
 ## **Output Format:**
 
 Your entire response must be a valid Python code snippet enclosed in triple backticks:

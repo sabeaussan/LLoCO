@@ -1,51 +1,15 @@
-import libcst as cst
+import re
 
-class TypeCommentInserter(cst.CSTTransformer):
-
-    def _build_comment_type(self, assign_node, call_node):
-        comment = "# "+assign_node.targets[0].target.value
-        comment += " is a numpy array of decision variables. Its shape is defined by "
-        shape_arg = call_node.args[1]
-        if isinstance(shape_arg.value, cst.Integer):
-            comment += f"({shape_arg.value.value},)"
-        elif isinstance(shape_arg.value, cst.Tuple):
-            comment += "("
-            for item in shape_arg.value.elements:
-                if isinstance(item, cst.Integer):
-                    comment += f"{item.value.value},"
-            comment = comment[:-1] + ")"
-        elif isinstance(shape_arg.value, cst.Name):
-            comment += f"the {shape_arg.value.value} variable."
-        else:
-            raise NotImplementedError("Unsupported shape type in define_variables call")
-                
-        return comment
-
-    def leave_Module(self, original_node, updated_node):
-        new_body = []
-        for stmt in updated_node.body:
-            new_stmt = None
-            if isinstance(stmt, cst.SimpleStatementLine):
-                # Check if it's an assignment statement
-                assign = stmt.body[0]
-                if isinstance(assign, cst.Assign):
-                    value = assign.value
-                    if isinstance(value, cst.Call):
-                        func = value.func
-                        if isinstance(func, cst.Name) and func.value == "define_variables":
-                            str_comment_warning = "# **IMPORTANT** : The define_variables method always returns a numpy array of decision variables."
-                            comment_warning = cst.Comment(value=str_comment_warning)
-                            str_comment_type = self._build_comment_type(assign, value)
-                            comment_type = cst.Comment(value=str_comment_type)
-                            lines = list(stmt.leading_lines) + [cst.EmptyLine(comment=comment_warning), cst.EmptyLine(comment=comment_type)]
-                            new_stmt = stmt.with_changes(
-                                leading_lines=tuple(lines)
-                            )
-            if new_stmt is not None:
-                new_body.append(new_stmt)
-            else:
-                new_body.append(stmt)
-        return updated_node.with_changes(body=new_body)
+# Regex: captures  var_name = define_variables(solver, shape=..., ...)
+_DEFVAR_RE = re.compile(
+    r"^(\s*)"                             # leading indent
+    r"(\w+)"                              # variable name
+    r"\s*=\s*define_variables\s*\("       # = define_variables(
+    r"[^)]*?"                             # args before shape (non-greedy)
+    r"shape\s*=\s*(\([^)]*\)|\w+)"       # shape=(tuple) or shape=name_or_int
+    r"[^)]*\)",                           # rest of args + closing )
+    re.MULTILINE,
+)
 
 def nested_loops(loops_iterables):
     """
@@ -70,10 +34,23 @@ def _nested_loops(loops_iterables, depth, indices):
             yield tuple(indices + [i])
 
 def add_type_comments(code):
-    #tree = cst.parse_module(code)
-    #updated_tree = tree.visit(TypeCommentInserter())
-    #return updated_tree.code
-    return code
+    """
+    Annotate each `define_variables(...)` call with a comment reminding the LLM
+    that the return value is a numpy array of OR-Tools decision variables.
+    """
+    def _insert_comment(match):
+        indent = match.group(1)
+        var_name = match.group(2)
+        shape_raw = match.group(3).strip()
+        comment = (
+            f"{indent}# IMPORTANT: {var_name} is a numpy array (dtype=object) "
+            f"of OR-Tools decision variables with shape={shape_raw}.\n"
+            f"{indent}# Index it like a numpy array. "
+            f"Use .flatten() to get a 1-D array for define_linear_expr.\n"
+        )
+        return comment + match.group(0)
+
+    return _DEFVAR_RE.sub(_insert_comment, code)
 
 
 
