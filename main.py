@@ -14,9 +14,11 @@ from typing import Optional, List, Dict, Any, Tuple
 import llm_utils
 import code_utils
 import io_utils
-from UI.utils import show_logo, SpinnerManager
-
-from wcwidth import wcswidth
+from UI.utils import (
+    show_logo, SpinnerManager, mode_str,
+    print_batch_header, print_batch_dry_run, print_batch_running,
+    print_batch_timeout, print_batch_result, print_batch_summary,
+)
 
 
 PROBLEM_BASE_DIR = "problems"
@@ -35,42 +37,6 @@ BATCH_PROBLEM_TIMEOUT: int = 600
 # Timeout for solution.py execution only (solver run).
 # Most LP/MIP problems should solve in under 2 min.  Set higher for hard MIPs.
 SOLUTION_TIMEOUT: int = 120
-
-
-# ----------------------------
-# Console formatting helpers
-# ----------------------------
-def _hr(char: str = "─", n: int = 70) -> str:
-    return char * n
-
-
-def _wlen(s: str) -> int:
-    return wcswidth(s)
-
-
-def _box(title: str, lines: List[str]) -> str:
-    width = max(_wlen(title), *(_wlen(x) for x in lines)) + 4
-    top = "╭" + "─" * width + "╮"
-    mid = [f"│  {title}{' ' * (width - 2 - _wlen(title))}│"]
-    for ln in lines:
-        mid.append(f"│  {ln}{' ' * (width - 2 - _wlen(ln))}│")
-    bot = "╰" + "─" * width + "╯"
-    return "\n".join([top] + mid + [bot])
-
-
-def _mode_str(all_flag, single_id, ids_csv, range_pair, start, limit) -> str:
-    if all_flag:
-        return "--all"
-    if single_id is not None:
-        return f"--id {single_id}"
-    if ids_csv is not None:
-        return f"--ids {ids_csv}"
-    if range_pair is not None:
-        return f"--range {range_pair[0]} {range_pair[1]}"
-    # start/limit mode
-    s = "" if start is None else f"--start {start} "
-    l = "" if limit is None else f"--limit {limit}"
-    return (s + l).strip()
 
 
 def extract_objective_value(optim_summary_path: str) -> Optional[float]:
@@ -311,6 +277,7 @@ def batch_run(
     dry_run: bool = False,
     report_path: str = "batch_results.csv",
     problem_timeout: int = BATCH_PROBLEM_TIMEOUT,
+    solution_timeout: int = SOLUTION_TIMEOUT,
 ):
     dataset_dir = os.path.join(data_root, dataset_name)
     if not os.path.isdir(dataset_dir):
@@ -349,20 +316,14 @@ def batch_run(
     results: List[Dict[str, Any]] = []
 
     if verbosity > 0:
-        print(
-            _box(
-                "🚀 LLoCO Batch Runner",
-                [
-                    f"Dataset: {dataset_name}",
-                    f"Source:  {format_label}",
-                    f"Mode:    {_mode_str(all_flag, single_id, ids_csv, range_pair, start, limit)}",
-                    f"Root:    {problems_root}",
-                    f"Total:   {len(selected_ids)} problem(s)",
-                    f"Timeout: {problem_timeout}s per problem",
-                ],
-            )
+        print_batch_header(
+            dataset_name=dataset_name,
+            format_label=format_label,
+            mode_label=mode_str(all_flag, single_id, ids_csv, range_pair, start, limit),
+            problems_root=problems_root,
+            total=len(selected_ids),
+            problem_timeout=problem_timeout,
         )
-        print()
 
     total = len(selected_ids)
     main_script = os.path.abspath(__file__)
@@ -410,13 +371,11 @@ def batch_run(
                 }
             )
             if verbosity > 0:
-                print(f"[{idx}/{total}] 🧪 DRY_RUN {problem_folder}")
+                print_batch_dry_run(idx, total, problem_folder)
             continue
 
         if verbosity > 0:
-            print(_hr())
-            print(f"[{idx}/{total}] ▶ Running {problem_folder}  (timeout {problem_timeout}s)")
-            print(_hr())
+            print_batch_running(idx, total, problem_folder, problem_timeout)
 
         cmd = [
             sys.executable,
@@ -425,6 +384,8 @@ def batch_run(
             problem_folder,
             "--problems-root",
             problems_root,
+            "--solution-timeout",
+            str(solution_timeout),
             "-v",
             str(verbosity),
         ]
@@ -442,10 +403,7 @@ def batch_run(
             timed_out = True
             returncode = -1
             if verbosity > 0:
-                print(
-                    f"\n⏱  TIMEOUT — {problem_folder} exceeded {problem_timeout}s, killing.",
-                    file=sys.stderr,
-                )
+                print_batch_timeout(problem_folder, problem_timeout)
             # Write a synthetic optim_summary so the error appears in the CSV
             optim_path_early = os.path.join(problem_path, "optim_summary.txt")
             with open(optim_path_early, "w", encoding="utf-8") as f:
@@ -494,26 +452,10 @@ def batch_run(
         )
 
         if verbosity > 0:
-            if status == "OK" and ok is True:
-                head = "✅ PASSED"
-            elif status == "OK" and ok is False:
-                head = "❌ FAILED"
-            elif status == "OK" and ok is None:
-                head = "⚠️ OK (no expected)"
-            else:
-                head = f"⚠️ {status}"
-
-            source_dir = obj.get("source_dir")
-            src_label = f"  ({source_dir})" if source_dir else ""
-            print(f"\n{head} — {problem_folder}{src_label}")
-            print(f"   ├─ Expected:  {expected}")
-            print(f"   ├─ Objective: {objective}")
-            if short_err:
-                print(f"   └─ Error:     {short_err}")
-            else:
-                print(f"   └─ Output:    {optim_path}")
-
-            print()
+            print_batch_result(
+                status, ok, problem_folder, expected, objective, optim_path,
+                short_err=short_err, source_dir=obj.get("source_dir"),
+            )
 
     with open(report_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["id", "folder", "source_dir", "expected", "objective", "ok", "status"])
@@ -524,9 +466,7 @@ def batch_run(
     comparable = sum(1 for r in results if r.get("ok") is not None)
     timeouts = sum(1 for r in results if r.get("status") == "TIMEOUT")
 
-    print(_hr())
-    print(f"✅ Report saved: {report_path}")
-    print(f"📊 Comparable: {comparable} | Passed: {passed} | Timeouts: {timeouts} | Total: {len(results)}")
+    print_batch_summary(report_path, comparable, passed, timeouts, len(results))
 
 
 def build_api_doc():
@@ -824,6 +764,12 @@ if __name__ == "__main__":
         default=BATCH_PROBLEM_TIMEOUT,
         help=f"Max seconds for the full per-problem pipeline (default: {BATCH_PROBLEM_TIMEOUT}s).",
     )
+    p_batch.add_argument(
+        "--solution-timeout",
+        type=int,
+        default=SOLUTION_TIMEOUT,
+        help=f"Max seconds for solution.py execution (default: {SOLUTION_TIMEOUT}s).",
+    )
 
     args = parser.parse_args()
 
@@ -849,6 +795,7 @@ if __name__ == "__main__":
             dry_run=args.dry_run,
             report_path=report_path,
             problem_timeout=args.problem_timeout,
+            solution_timeout=args.solution_timeout,
         )
     else:
         if not args.fname:

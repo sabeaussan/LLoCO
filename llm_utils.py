@@ -210,10 +210,19 @@ _ZERO_OBJ_PATTERN = re.compile(
 )
 
 
+# OR-Tools INFEASIBLE status code (pywraplp.Solver.INFEASIBLE == 2)
+_INFEASIBLE_STATUS_RE = re.compile(r"STATUS:\s*2\b")
+
+
 def _is_infeasible(stdout: str, stderr: str) -> bool:
-    """Return True if the solver output indicates an INFEASIBLE model."""
+    """Return True if the solver output indicates an INFEASIBLE model.
+    Checks both textual patterns and the numeric status code (STATUS: 2)."""
     combined = (stdout or "") + (stderr or "")
-    return bool(_INFEASIBLE_PATTERNS.search(combined))
+    if _INFEASIBLE_PATTERNS.search(combined):
+        return True
+    if _INFEASIBLE_STATUS_RE.search(combined):
+        return True
+    return False
 
 
 # Patterns that indicate a runtime ValueError / data dependency error in
@@ -915,13 +924,17 @@ def _check_objective_direction(context: str, obj_snippet: str) -> Optional[str]:
         return None
 
 
+_MAXIMIZE_ASSIGN_RE = re.compile(r"(maximize\s*=\s*)(True|False)", re.IGNORECASE)
+
+
 def _flip_objective_direction(obj_snippet: str) -> str:
-    """Flip maximize=True to maximize=False and vice versa."""
+    """Flip maximize=True to maximize=False and vice versa,
+    regardless of spacing around '='."""
     def _flip(m):
-        val = m.group(1)
+        val = m.group(2)
         new_val = "False" if val == "True" else "True"
-        return m.group(0).replace(f"maximize={val}", f"maximize={new_val}")
-    return _MAXIMIZE_RE.sub(_flip, obj_snippet)
+        return m.group(1) + new_val
+    return _MAXIMIZE_ASSIGN_RE.sub(_flip, obj_snippet)
 
 
 def implement_optimization(

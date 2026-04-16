@@ -853,6 +853,98 @@ def diet_problem(food_set, nutrient_set, food_cost, ...):
 
 Le LLM dispose des noms exacts des paramètres, de leurs types et de la direction d'optimisation attendue, ce qui réduit les erreurs de modélisation sur les datasets ComplexOR/LPWP.
 
+### 5.9 Détection INFEASIBLE par status code numérique (Codex review)
+
+**Fichier modifié :** `llm_utils.py`  
+**Nouveau regex :** `_INFEASIBLE_STATUS_RE`
+
+#### Problème
+
+`_is_infeasible` ne détectait que les patterns textuels (ex. `MPSOLVER_INFEASIBLE`). Or la probe imprime `STATUS: 2` (code numérique OR-Tools pour INFEASIBLE) sans nécessairement le texte associé. Résultat : la boucle de retry contraintes ne se déclenchait pas dans certains cas.
+
+#### Solution
+
+Ajout d'un regex `_INFEASIBLE_STATUS_RE = re.compile(r"STATUS:\s*2\b")` dans `_is_infeasible`. La fonction vérifie maintenant les deux : patterns textuels ET status code numérique.
+
+#### Impact
+
+Détection plus robuste des modèles INFEASIBLE, indépendante du format de message d'OR-Tools.
+
+### 5.10 Correction du flip de direction avec espaces (Codex review)
+
+**Fichier modifié :** `llm_utils.py`  
+**Nouveau regex :** `_MAXIMIZE_ASSIGN_RE`
+
+#### Problème
+
+`_flip_objective_direction` utilisait `.replace(f"maximize={val}")` pour inverser la direction. Mais `_MAXIMIZE_RE` accepte des espaces autour de `=` (ex. `maximize = True`). Dans ce cas, le `.replace()` ne trouvait pas la chaîne exacte et le flip échouait silencieusement.
+
+#### Solution
+
+Remplacement de `.replace()` par un regex dédié `_MAXIMIZE_ASSIGN_RE = re.compile(r"(maximize\s*=\s*)(True|False)")` qui capture le préfixe avec espaces et remplace uniquement la valeur.
+
+#### Validation
+
+```python
+_flip("maximize = True")   → "maximize = False"   ✅
+_flip("maximize=False")    → "maximize=True"       ✅
+_flip("maximize =True")    → "maximize =False"     ✅
+```
+
+#### Impact
+
+Le flip de direction fonctionne maintenant quel que soit le style de formatage du LLM.
+
+### 5.11 Propagation `--solution-timeout` au subprocess batch (Codex review)
+
+**Fichier modifié :** `main.py`
+
+#### Problème
+
+`batch_run` ne passait jamais `--solution-timeout` au subprocess enfant. Chaque problème utilisait le défaut 120s, même si `--problem-timeout` était plus élevé. Des problèmes solvables mais lents échouaient prématurément avec `RUN_FAILED`.
+
+#### Solution
+
+- Ajout du paramètre `solution_timeout` à `batch_run()`
+- Ajout de `--solution-timeout` dans la commande `cmd` du subprocess
+- Ajout de `--solution-timeout` comme argument CLI du batch parser
+- Propagation de `args.solution_timeout` vers `batch_run()`
+
+#### Impact
+
+Le timeout du solveur est maintenant configurable en mode batch et cohérent entre parent et enfant.
+
+### 5.12 Refactoring affichage — centralisation dans `UI/utils.py`
+
+**Fichiers modifiés :** `UI/utils.py`, `main.py`
+
+#### Problème (review sabeaussan)
+
+Tout le code d'affichage batch (box, horizontal rules, formatage des résultats) était dans `main.py`, alors que le projet dispose d'un module `UI/utils.py` dédié à l'affichage.
+
+#### Solution
+
+**Déplacé de `main.py` vers `UI/utils.py` :**
+- `_hr()` → `hr()`
+- `_wlen()` → `wlen()`
+- `_box()` → `box()`
+- `_mode_str()` → `mode_str()`
+- Import `wcwidth` déplacé dans `UI/utils.py`
+
+**Nouvelles fonctions d'affichage batch dans `UI/utils.py` :**
+- `print_batch_header()` — box avec configuration du batch
+- `print_batch_dry_run()` — ligne dry-run
+- `print_batch_running()` — header de problème en cours
+- `print_batch_timeout()` — message timeout
+- `print_batch_result()` — PASSED/FAILED/status avec expected/objective/source_dir
+- `print_batch_summary()` — ligne finale (report + stats)
+
+**`main.py` allégé** — plus aucune logique d'affichage, tout passe par `UI/utils.py`.
+
+#### Impact
+
+Séparation propre logique métier / affichage. `main.py` est allégé et plus lisible.
+
 ---
 
 ## 6) Recommandations futures
@@ -913,6 +1005,15 @@ Le LLM dispose des noms exacts des paramètres, de leurs types et de la directio
 | `llm_utils.py` | `implement_optimization` step 3b — direction validation post-objectif | 5.7 |
 | `main.py` | `_build_en_question` — paramètre optionnel `code_example` | 5.8 |
 | `main.py` | `load_subdir_dataset` — lecture et injection de `code_example.py` | 5.8 |
+| `llm_utils.py` | `_INFEASIBLE_STATUS_RE` — détection INFEASIBLE par status code `STATUS: 2` | 5.9 |
+| `llm_utils.py` | `_is_infeasible` — ajout vérification status code numérique OR-Tools | 5.9 |
+| `llm_utils.py` | `_MAXIMIZE_ASSIGN_RE` — regex robuste pour flip avec espaces | 5.10 |
+| `llm_utils.py` | `_flip_objective_direction` — réécriture avec regex au lieu de `.replace()` | 5.10 |
+| `main.py` | `batch_run` — nouveau paramètre `solution_timeout`, propagé au subprocess | 5.11 |
+| `main.py` | `--solution-timeout` ajouté au batch CLI parser | 5.11 |
+| `UI/utils.py` | Fonctions `hr`, `wlen`, `box`, `mode_str` déplacées depuis `main.py` | 5.12 |
+| `UI/utils.py` | Nouvelles fonctions `print_batch_*` (header, dry_run, running, timeout, result, summary) | 5.12 |
+| `main.py` | Suppression de tout le code d'affichage — appels délégués à `UI/utils.py` | 5.12 |
 
 ---
 
@@ -934,3 +1035,7 @@ Les erreurs de qualité de modélisation (direction min/max, contraintes manquan
 - Annotations numpy automatiques sur les variables de décision (section 5.6)
 - Validation automatique de la direction d'optimisation via probe LLM (section 5.7)
 - Injection des signatures et descriptions de paramètres des datasets ComplexOR/LPWP (section 5.8)
+- Détection INFEASIBLE renforcée par status code numérique (section 5.9)
+- Flip de direction robuste indépendant du formatage (section 5.10)
+- Propagation du solution-timeout en mode batch (section 5.11)
+- Code d'affichage centralisé dans `UI/utils.py` (section 5.12)
