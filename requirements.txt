@@ -1,4 +1,6 @@
 ortools
 libcst
 requests
+urllib3<2
+wcwidth
 
