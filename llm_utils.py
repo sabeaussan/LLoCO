@@ -351,8 +351,9 @@ def openai_ask_requests(
     model="gpt-5",
     response_format=None,
     max_tokens=10000,
-    timeout=90,
+    timeout=7200,
     max_retries=4,
+    test=False
 ):
     """
     Robust wrapper:
@@ -361,37 +362,54 @@ def openai_ask_requests(
     - readable error messages (HTTP + preview)
     - automatic retry (timeout / 429 / 5xx)
     """
+    if test:
+        api_key = os.environ.get("OPENAI_API_KEY")
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            for fname in [".api_key.txt", "api_key.txt"]:
+                path = os.path.join(os.getcwd(), fname)
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as f:
+                        api_key = f.read().strip()
+                    break
 
-    if not api_key:
-        for fname in [".api_key.txt", "api_key.txt"]:
-            path = os.path.join(os.getcwd(), fname)
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    api_key = f.read().strip()
-                break
+        if not api_key:
+            raise RuntimeError(
+                "API key not found (.api_key.txt / api_key.txt / OPENAI_API_KEY)."
+            )
 
-    if not api_key:
-        raise RuntimeError(
-            "API key not found (.api_key.txt / api_key.txt / OPENAI_API_KEY)."
+        url = (
+            f"https://cld.akkodis.com/api/openai/deployments/models-{model}"
+            f"/chat/completions?api-version=2024-12-01-preview"
         )
 
-    url = (
-        f"https://cld.akkodis.com/api/openai/deployments/models-{model}"
-        f"/chat/completions?api-version=2024-12-01-preview"
-    )
+        headers = {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-cache",
+            "api-key": api_key,
+        }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-cache",
-        "api-key": api_key,
-    }
+        data = {
+            "max_tokens": max_tokens,
+            "messages": messages,
+        }
+    else:
+        base_url = os.environ.get("LLAMA_SERVER_URL", "http://localhost:8080")
 
-    data = {
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }
+        url = f"{base_url}/v1/chat/completions"
+        headers = {"Content-Type": "application/json"}
+
+        for m in messages:
+            if m["role"] == "system":
+                m["content"] = ( "IMPORTANT : Whenn you give python code, you must use a Markdown bloc as follow:\n```python\n<code here>\n```\n\n" ) + m["content"]
+            break
+
+        data = {
+            "models": "Qwen2.5-7B-Instruct-Q8_0.gguf",
+            "messages": messages,
+            "max_tokens": 500,
+            "temperature": 0.2
+        }
 
     if response_format is not None:
         data["response_format"] = response_format
