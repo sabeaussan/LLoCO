@@ -278,6 +278,8 @@ def batch_run(
     report_path: str = "batch_results.csv",
     problem_timeout: int = BATCH_PROBLEM_TIMEOUT,
     solution_timeout: int = SOLUTION_TIMEOUT,
+    model: str = "gpt-5",
+    temperature: Optional[float] = None,
 ):
     dataset_dir = os.path.join(data_root, dataset_name)
     if not os.path.isdir(dataset_dir):
@@ -323,6 +325,8 @@ def batch_run(
             problems_root=problems_root,
             total=len(selected_ids),
             problem_timeout=problem_timeout,
+            model=model,
+            temperature=temperature,
         )
 
     total = len(selected_ids)
@@ -386,9 +390,13 @@ def batch_run(
             problems_root,
             "--solution-timeout",
             str(solution_timeout),
+            "--model",
+            model,
             "-v",
             str(verbosity),
         ]
+        if temperature is not None:
+            cmd += ["--temp", str(temperature)]
 
         # ---------------------------------------------------------------
         # Run with timeout so a hanging solver or LLM call never blocks
@@ -740,6 +748,19 @@ if __name__ == "__main__":
         default=SOLUTION_TIMEOUT,
         help=f"Max seconds for solution.py execution (default: {SOLUTION_TIMEOUT}s).",
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="gpt-5",
+        choices=["gpt-5", "gpt-4", "gpt-4o", "gpt-4o-mini"],
+        help="LLM model to use (default: gpt-5). Note: gpt-5 only supports temperature=1.0.",
+    )
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=None,
+        help="Sampling temperature [0.0–2.0]. Only works with gpt-4 / gpt-4o / gpt-4o-mini.",
+    )
 
     # --- Batch ---
     p_batch = sub.add_parser("batch", help="Run a batch from a dataset JSONL.")
@@ -770,8 +791,71 @@ if __name__ == "__main__":
         default=SOLUTION_TIMEOUT,
         help=f"Max seconds for solution.py execution (default: {SOLUTION_TIMEOUT}s).",
     )
+    p_batch.add_argument(
+        "--model",
+        type=str,
+        default="gpt-5",
+        choices=["gpt-5", "gpt-4", "gpt-4o", "gpt-4o-mini"],
+        help="LLM model to use (default: gpt-5). Note: gpt-5 only supports temperature=1.0.",
+    )
+    p_batch.add_argument(
+        "--temp",
+        type=float,
+        default=None,
+        help="Sampling temperature [0.0–2.0]. Only works with gpt-4 / gpt-4o / gpt-4o-mini.",
+    )
+
+    # --- Bench (variability benchmark: N runs per temperature) ---
+    p_bench = sub.add_parser(
+        "bench",
+        help="Run a variability benchmark (N runs per temperature) and produce a comparison report.",
+    )
+    p_bench.add_argument("--dataset", required=True)
+    p_bench.add_argument("--data-root", default="datasets")
+    p_bench.add_argument(
+        "--runs", type=int, default=5,
+        help="Number of independent runs per temperature (default: 5).",
+    )
+    p_bench.add_argument(
+        "--model", type=str, default="gpt-4o",
+        choices=["gpt-5", "gpt-4", "gpt-4o", "gpt-4o-mini"],
+        help="LLM model used for all runs (default: gpt-4o).",
+    )
+    p_bench.add_argument(
+        "--temps", type=str, default="0,0.7",
+        help="Comma-separated list of temperatures (e.g. '0,0.7'). "
+             "Use 'default' for the model's API default. Default: '0,0.7'.",
+    )
+
+    # Selection (same options as batch)
+    p_bench.add_argument("--all", action="store_true")
+    p_bench.add_argument("--id", type=int, default=None)
+    p_bench.add_argument("--ids", type=str, default=None)
+    p_bench.add_argument("--range", nargs=2, type=int, default=None)
+    p_bench.add_argument("--start", type=int, default=None)
+    p_bench.add_argument("--limit", type=int, default=None)
+
+    p_bench.add_argument("--tolerance", type=float, default=1e-6)
+    p_bench.add_argument(
+        "--problem-timeout", type=int, default=BATCH_PROBLEM_TIMEOUT,
+        help=f"Max seconds for the full per-problem pipeline (default: {BATCH_PROBLEM_TIMEOUT}s).",
+    )
+    p_bench.add_argument(
+        "--solution-timeout", type=int, default=SOLUTION_TIMEOUT,
+        help=f"Max seconds for solution.py execution (default: {SOLUTION_TIMEOUT}s).",
+    )
+    p_bench.add_argument(
+        "--output-root", default="benchmarks",
+        help="Root directory for benchmark outputs (default: benchmarks/).",
+    )
 
     args = parser.parse_args()
+
+    # Apply model / temperature config globally before any LLM call
+    llm_utils.set_llm_config(
+        model=getattr(args, "model", None),
+        temperature=getattr(args, "temp", None),
+    )
 
     if args.cmd == "batch":
         report_path = args.report
@@ -796,8 +880,57 @@ if __name__ == "__main__":
             report_path=report_path,
             problem_timeout=args.problem_timeout,
             solution_timeout=args.solution_timeout,
+            model=args.model,
+            temperature=args.temp,
+        )
+    elif args.cmd == "bench":
+        import bench
+
+        # Parse --temps "0,0.7" or "default,0.7" → list of Optional[float]
+        def _parse_temp(tok: str) -> Optional[float]:
+            tok = tok.strip().lower()
+            if tok in ("", "default", "none"):
+                return None
+            return float(tok)
+
+        temps = [_parse_temp(t) for t in args.temps.split(",") if t.strip()]
+        if not temps:
+            parser.error("--temps must list at least one value (e.g. '0' or '0,0.7').")
+
+        # Validate selection: exactly one mode (reuse select_problem_ids logic)
+        selection = {
+            "all_flag": args.all,
+            "single_id": args.id,
+            "ids_csv": args.ids,
+            "range_pair": args.range,
+            "start": args.start,
+            "limit": args.limit,
+        }
+        if not any([args.all, args.id is not None, args.ids,
+                    args.range, args.start is not None, args.limit is not None]):
+            parser.error(
+                "bench: choose a selection mode "
+                "(--all OR --id OR --ids OR --range OR --start/--limit)."
+            )
+
+        if args.runs < 1:
+            parser.error("--runs must be >= 1.")
+
+        bench.run_benchmark(
+            dataset=args.dataset,
+            model=args.model,
+            temps=temps,
+            n_runs=args.runs,
+            selection=selection,
+            data_root=args.data_root,
+            problem_timeout=args.problem_timeout,
+            solution_timeout=args.solution_timeout,
+            tolerance=args.tolerance,
+            overwrite=True,
+            verbosity=args.verbosity,
+            output_root=args.output_root,
         )
     else:
         if not args.fname:
-            parser.error("the following arguments are required: -f/--fname (or use 'batch')")
+            parser.error("the following arguments are required: -f/--fname (or use 'batch'/'bench')")
         main(args)

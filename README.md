@@ -18,19 +18,22 @@ LLoCO uses OpenAI models (GPT-5). Your API key should be saved inside `api_key.t
 
 ```text
 LLoCO/
-├── main.py                  # Entry point (single + batch modes)
+├── main.py                  # Entry point (single + batch + bench modes)
+├── bench.py                 # Variability benchmark (N runs per temperature)
 ├── llm_utils.py             # LLM pipeline (gating, probing, retries)
 ├── code_utils.py            # Code extraction, sanitization, undefined-name detection
 ├── optimization_utils.py    # OR-Tools wrapper (solver, variables, objective, constraints)
 ├── log_utils.py             # Solution printing and status interpretation
 ├── io_utils.py              # CSV/JSON handling and problem refinement
 ├── utils.py                 # Helpers (type annotations, nested loops)
+├── UI/utils.py              # Console formatting (boxes, batch display)
 ├── prompts/                 # System prompts for each pipeline stage
 ├── problems/                # Generated problem folders (one per problem)
 │   └── <dataset>_<id>/
 │       ├── user_input.md    # Problem description
 │       ├── solution.py      # Generated solver code
 │       └── optim_summary.txt# Solver output + objective value
+├── benchmarks/              # Bench mode outputs (one dir per benchmark)
 └── datasets/                # Evaluation datasets
     ├── IndustryOR/          # 100 problems (JSONL format)
     ├── ComplexOR/           # 18 problem types (subdirectory format)
@@ -183,9 +186,55 @@ python3 main.py batch --dataset LPWP --range 0 50
 | `--overwrite` | Recreate problem folders from scratch | off |
 | `--dry-run` | Only generate folders, don't solve | off |
 | `--tolerance` | Float comparison tolerance for pass/fail | 1e-6 |
-| `--report` | Output CSV path | `batch_results.csv` |
+| `--report` | Output CSV path | `batch_results_<dataset>_<date>.csv` |
 | `--problem-timeout` | Max seconds per problem (full pipeline) | 600 |
+| `--solution-timeout` | Max seconds for `solution.py` execution | 120 |
+| `--model` | LLM model: `gpt-5`, `gpt-4`, `gpt-4o`, `gpt-4o-mini` | `gpt-5` |
+| `--temp` | Sampling temperature [0.0–2.0] (only for `gpt-4*` models) | None |
 | `-v` | Verbosity (0=silent, 1=normal, 2=debug) | 1 |
+
+### Model & temperature
+
+LLoCO supports several models on the Akkodis OpenAI endpoint:
+
+| Model | Reasoning | Supports `temperature` |
+| ----- | --------- | ---------------------- |
+| `gpt-5` (default) | ✅ Best for OR | ❌ Locked at default 1.0 |
+| `gpt-4` | ❌ | ✅ Any value in [0, 2] |
+| `gpt-4o` | ❌ | ✅ Any value in [0, 2] |
+| `gpt-4o-mini` | ❌ | ✅ Any value in [0, 2] |
+
+**Models that accept `temperature` — recommendations:**
+
+| Model | Status | Recommendation |
+| ----- | ------ | -------------- |
+| `gpt-4` | ✅ Available, accepts `temperature` | Most stable and well-known model |
+| `gpt-4o` | ✅ Available, accepts `temperature` | Faster and cheaper than `gpt-4` |
+| `gpt-4o-mini` | ✅ Available, accepts `temperature` | The fastest / cheapest |
+| `gpt-4-turbo`, `gpt-4.1` | ❌ Not deployed | Unavailable on the Akkodis endpoint |
+
+**Use `--temp` to tune determinism / variability:**
+
+```bash
+# Reproducible runs (same output every time)
+python3 main.py batch --dataset IndustryOR --all --model gpt-4o --temp 0
+
+# Default behaviour (deterministic-ish)
+python3 main.py batch --dataset IndustryOR --all --model gpt-4o --temp 0.2
+
+# Creative / variable runs (useful for ensembling / pass@k testing)
+python3 main.py batch --dataset IndustryOR --all --model gpt-4o --temp 0.7
+```
+
+**Important:** `gpt-5` only accepts the default temperature (1.0). Passing `--temp` with `gpt-5` will trigger an API error.
+
+You can also set defaults via environment variables:
+
+```bash
+export LLOCO_MODEL=gpt-4o
+export LLOCO_TEMPERATURE=0.5
+python3 main.py batch --dataset IndustryOR --id 1
+```
 
 ### Batch output
 
@@ -217,6 +266,115 @@ Possible status values:
 | `TIMEOUT` | Exceeded `--problem-timeout` |
 | `ID_NOT_FOUND` | Requested ID not in dataset |
 | `DRY_RUN` | `--dry-run` mode, not executed |
+
+---
+
+## Variability benchmarks (`bench`)
+
+The `bench` subcommand runs the same dataset **N times per temperature** to measure **pipeline stability** and **compare configurations side-by-side** (e.g., `temp=0` vs `temp=0.7` on `gpt-4o`).
+
+It is the right tool to answer questions like:
+- "Is the pipeline reproducible at `temp=0`?"
+- "How much variability does `temp=0.7` introduce on ComplexOR?"
+- "Which configuration produces the highest pass rate?"
+
+### Bench commands
+
+```bash
+# Default: 5 runs at temp=0 and 5 runs at temp=0.7 with gpt-4o
+python3 main.py bench --dataset ComplexOR --all
+
+# Custom: 10 runs at temp=0.5 only
+python3 main.py bench --dataset IndustryOR --range 1 20 --runs 10 --temps 0.5
+
+# Sweep: 3 runs each at three temperatures
+python3 main.py bench --dataset LPWP --id 0 --runs 3 --temps 0,0.3,0.7
+
+# Different model
+python3 main.py bench --dataset ComplexOR --all --runs 5 --model gpt-4o-mini --temps 0,0.7
+```
+
+### Bench flags
+
+| Flag | Description | Default |
+| ---- | ----------- | ------- |
+| `--dataset` | Dataset name (required) | — |
+| `--runs` | Number of independent runs per temperature | 5 |
+| `--model` | LLM model | `gpt-4o` |
+| `--temps` | Comma-separated list of temperatures (e.g. `0,0.7`). Use `default` for the model's API default. | `0,0.7` |
+| `--all` / `--id` / `--ids` / `--range` / `--start` / `--limit` | Problem selection (one mode required, same as batch) | — |
+| `--problem-timeout` | Max seconds per problem | 600 |
+| `--solution-timeout` | Max seconds for `solution.py` | 120 |
+| `--tolerance` | Float tolerance for pass/fail | 1e-6 |
+| `--output-root` | Root directory for benchmark results | `benchmarks/` |
+
+### Output structure
+
+Each benchmark creates an isolated, timestamped directory:
+
+```
+benchmarks/<dataset>_<model>_<YYYYMMDD_HHMMSS>/
+├── config.json                    # full bench config (reproducibility)
+├── temp_0.0/
+│   ├── run_1.csv                  # raw batch_results from each run
+│   ├── ...
+│   ├── run_5.csv
+│   └── per_problem.csv            # per-problem stats for this temperature
+├── temp_0.7/
+│   ├── ...
+├── overall.csv                    # one row per (model, temperature)
+└── summary.txt                    # human-readable report
+```
+
+### Per-problem stats (`per_problem.csv`)
+
+For each problem, across the N runs:
+
+| Column | Meaning |
+| ------ | ------- |
+| `id`, `source_dir`, `expected` | Problem identifiers |
+| `n_runs` / `n_ok` / `n_passed` | Total runs / pipeline-completed / objective matches `expected` |
+| `pass_rate` | `n_passed / n_runs` |
+| `n_unique_objectives` | Distinct objective values produced (1 = fully stable) |
+| `mean_objective` / `std_objective` | Mean and stddev of the objective |
+| `min_objective` / `max_objective` | Range of objectives |
+| `statuses` | `\|`-joined status of each run (e.g. `OK\|OK\|TIMEOUT`) |
+
+### Overall stats (`overall.csv`)
+
+One row per `(model, temperature)`:
+
+| Column | Meaning |
+| ------ | ------- |
+| `n_problems`, `n_runs`, `total_evaluations` | Grid size |
+| `avg_pass_rate` | Mean pass rate across all problems |
+| `fully_passing` | Problems passing on **all** runs |
+| `always_failing` | Problems failing on **all** runs |
+| `fully_stable` | Problems with the **same objective** on every run |
+| `avg_unique_objectives` | Mean diversity of objectives per problem |
+| `avg_std_objective` | Mean stddev of objective values across problems |
+
+### Human-readable report (`summary.txt`)
+
+The summary contains three tables:
+
+1. **OVERALL** — pass rate / stability metrics per temperature
+2. **PER-PROBLEM** — detailed stats for each problem at each temperature
+3. **COMPARISON** — side-by-side pass rate per problem when multiple temperatures are tested
+
+Example:
+
+```
+==============================================================================
+OVERALL — one row per (model, temperature)
+==============================================================================
+    temp | problems |  runs |  avg pass |  fully ✅ |  fully ❌ |  stable |   avg σ
+------------------------------------------------------------------------------------
+     0.0 |       18 |     5 |     88.9% |       16 |        2 |      18 |     0.0
+     0.7 |       18 |     5 |     72.2% |       11 |        2 |       9 |  3.21
+```
+
+`temp=0` shows perfect stability (all problems produce the same objective on every run); `temp=0.7` introduces variability (only 9/18 problems are fully stable) but in this example actually has a lower pass rate.
 
 ---
 
@@ -256,6 +414,33 @@ python3 main.py batch --dataset ComplexOR --all --dry-run
 
 ```bash
 python3 main.py batch --dataset LPWP --all --problem-timeout 300
+```
+
+### Test variability — use the `bench` subcommand
+
+For systematic variability testing, prefer the `bench` subcommand (see the
+"Variability benchmarks" section above). It handles N runs per temperature,
+aggregation, and side-by-side comparison automatically:
+
+```bash
+python3 main.py bench --dataset IndustryOR --id 7 --runs 5 --temps 0,0.7
+```
+
+The manual loop below is only useful when you want full control over each run:
+
+```bash
+for i in 1 2 3 4 5; do
+  python3 main.py batch --dataset IndustryOR --id 7 \
+      --model gpt-4o --temp 0.7 --overwrite \
+      --report batch_run_${i}.csv
+done
+```
+
+### Compare models side-by-side
+
+```bash
+python3 main.py batch --dataset IndustryOR --all --model gpt-5 --report results_gpt5.csv
+python3 main.py batch --dataset IndustryOR --all --model gpt-4o --temp 0 --report results_gpt4o.csv
 ```
 
 ---

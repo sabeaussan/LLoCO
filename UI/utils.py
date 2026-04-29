@@ -54,20 +54,20 @@ def mode_str(all_flag, single_id, ids_csv, range_pair, start, limit) -> str:
 # Batch display functions
 # ---------------------------------------------------------------------------
 
-def print_batch_header(dataset_name, format_label, mode_label, problems_root, total, problem_timeout):
-    print(
-        box(
-            "🚀 LLoCO Batch Runner",
-            [
-                f"Dataset: {dataset_name}",
-                f"Source:  {format_label}",
-                f"Mode:    {mode_label}",
-                f"Root:    {problems_root}",
-                f"Total:   {total} problem(s)",
-                f"Timeout: {problem_timeout}s per problem",
-            ],
-        )
-    )
+def print_batch_header(dataset_name, format_label, mode_label, problems_root, total,
+                       problem_timeout, model=None, temperature=None):
+    lines = [
+        f"Dataset: {dataset_name}",
+        f"Source:  {format_label}",
+        f"Mode:    {mode_label}",
+        f"Root:    {problems_root}",
+        f"Total:   {total} problem(s)",
+        f"Timeout: {problem_timeout}s per problem",
+    ]
+    if model:
+        temp_label = "default" if temperature is None else str(temperature)
+        lines.append(f"Model:   {model}  (temp={temp_label})")
+    print(box("🚀 LLoCO Batch Runner", lines))
     print()
 
 

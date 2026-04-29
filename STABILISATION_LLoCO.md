@@ -945,6 +945,310 @@ Tout le code d'affichage batch (box, horizontal rules, formatage des résultats)
 
 Séparation propre logique métier / affichage. `main.py` est allégé et plus lisible.
 
+### 5.13 Configuration runtime du modèle et de la temperature
+
+**Fichiers modifiés :** `llm_utils.py`, `main.py`, `UI/utils.py`  
+**Nouveaux flags CLI :** `--model`, `--temp`  
+**Nouvelles fonctions :** `set_llm_config()`  
+**Variables module-level :** `LLM_MODEL`, `LLM_TEMPERATURE`
+
+#### Problème
+
+Le pipeline était figé sur `gpt-5`. Or :
+- `gpt-5` (modèle reasoning) **n'accepte pas de paramètre `temperature`** (toute valeur autre que la default 1.0 est rejetée par l'API : `Unsupported value: 'temperature' does not support 0 with this model`)
+- Impossible donc de tester la **variabilité** du pipeline (pass@k, ensembling), ni de **forcer la déterministe** (temperature=0)
+- Aucun moyen de basculer rapidement entre `gpt-5`, `gpt-4`, `gpt-4o`, `gpt-4o-mini` selon le contexte (vitesse vs qualité vs coût)
+
+#### Solution
+
+**a) Module-level config dans `llm_utils.py`** :
+
+```python
+LLM_MODEL: str = os.environ.get("LLOCO_MODEL", "gpt-5")
+LLM_TEMPERATURE: Optional[float] = float(os.environ.get("LLOCO_TEMPERATURE")) if ... else None
+
+def set_llm_config(model=None, temperature=None):
+    global LLM_MODEL, LLM_TEMPERATURE
+    if model is not None: LLM_MODEL = model
+    if temperature is not None: LLM_TEMPERATURE = temperature
+```
+
+**b) `openai_ask_requests` accepte `temperature` et utilise les defaults globaux** :
+
+```python
+def openai_ask_requests(messages, model=None, ..., temperature=None):
+    if model is None: model = LLM_MODEL
+    if temperature is None: temperature = LLM_TEMPERATURE
+    ...
+    # N'inclure temperature dans le payload QUE si non-None
+    # (gpt-5 rejette toute valeur ≠ 1)
+    if temperature is not None:
+        data["temperature"] = temperature
+```
+
+**c) Flags CLI dans `main.py`** (parser principal et sous-parser batch) :
+
+```python
+parser.add_argument("--model", choices=["gpt-5","gpt-4","gpt-4o","gpt-4o-mini"], default="gpt-5")
+parser.add_argument("--temp", type=float, default=None)
+```
+
+Application immédiate après `parse_args()` :
+
+```python
+llm_utils.set_llm_config(model=args.model, temperature=args.temp)
+```
+
+**d) Propagation au subprocess batch** : `batch_run` accepte `model` et `temperature`, et les ajoute à `cmd` :
+
+```python
+cmd += ["--model", model]
+if temperature is not None:
+    cmd += ["--temp", str(temperature)]
+```
+
+**e) `summarize_problem_description` ne force plus `gpt-5`** — utilise le modèle configuré.
+
+**f) Header batch enrichi** dans `UI/utils.py` :
+
+```
+│  Model:   gpt-4o  (temp=0.5)                   │
+```
+
+#### Modèles testés sur l'endpoint Akkodis
+
+| Modèle | Disponible | Accepte `temperature` |
+|--------|-----------|----------------------|
+| `gpt-5` | ✅ | ❌ (locked à 1.0) |
+| `gpt-4` | ✅ | ✅ [0, 2] |
+| `gpt-4o` | ✅ | ✅ [0, 2] |
+| `gpt-4o-mini` | ✅ | ✅ [0, 2] |
+| `gpt-4-turbo`, `gpt-4.1` | ❌ Pas déployés | — |
+
+#### Modèles acceptant `temperature` — recommandations
+
+| Modèle | Statut | Recommandation |
+|--------|--------|----------------|
+| `gpt-4` | ✅ Disponible, accepte `temperature` | Modèle le plus stable et le plus connu |
+| `gpt-4o` | ✅ Disponible, accepte `temperature` | Plus rapide et moins cher que `gpt-4` |
+| `gpt-4o-mini` | ✅ Disponible, accepte `temperature` | Le plus rapide / le moins cher |
+| `gpt-4-turbo`, `gpt-4.1` | ❌ Pas déployés | Non disponibles sur l'endpoint Akkodis |
+
+#### Exemples d'usage
+
+```bash
+# Default (gpt-5, pas de temperature)
+python3 main.py batch --dataset IndustryOR --id 1
+
+# gpt-4o déterministe (reproductibilité)
+python3 main.py batch --dataset IndustryOR --all --model gpt-4o --temp 0
+
+# gpt-4o-mini créatif (test de variabilité)
+python3 main.py batch --dataset ComplexOR --all --model gpt-4o-mini --temp 0.7
+
+# Via variables d'environnement
+LLOCO_MODEL=gpt-4o LLOCO_TEMPERATURE=0.5 python3 main.py batch ...
+```
+
+#### Impact
+
+- Tests de **variabilité / pass@k** maintenant possibles (lancer N fois le même problème avec `temp > 0`)
+- Tests **reproductibles** (`temp=0` sur `gpt-4o`)
+- Comparaison **côte à côte** entre modèles (qualité/vitesse/coût)
+- Compat préservée : `gpt-5` reste le défaut, et la temperature n'est envoyée à l'API que si explicitement demandée
+- Configuration visible dans le header batch pour traçabilité
+
+### 5.14 Sous-commande `bench` — benchmark de variabilité
+
+**Nouveau fichier :** `bench.py`  
+**Fichier modifié :** `main.py` (sous-parser `bench`)  
+**Mise à jour :** `.gitignore` (ajout `benchmarks/`)
+
+#### Problème
+
+La section 5.13 a rendu possible la variation de modèle/temperature, mais lancer manuellement N fois le même dataset puis comparer les résultats est laborieux et source d'erreurs (oubli de runs, pollution entre runs, agrégation manuelle des CSV...).
+
+#### Solution
+
+Nouvelle sous-commande `bench` qui orchestre :
+1. **N runs** indépendants par configuration (température)
+2. **M températures** balayées en une seule commande
+3. **Isolation** : chaque run a son propre `problems_root` pour éviter la pollution
+4. **Agrégation automatique** : stats par-problème + stats globales par config
+5. **Rapport human-readable** : OVERALL + PER-PROBLEM + COMPARISON (côte à côte)
+
+#### Commande
+
+```bash
+python3 main.py bench --dataset ComplexOR --all --runs 5 --model gpt-4o --temps 0,0.7
+python3 main.py bench --dataset IndustryOR --range 1 20 --runs 3 --temps 0,0.3,0.7
+python3 main.py bench --dataset LPWP --id 0 --runs 5 --model gpt-4o-mini --temps 0
+```
+
+#### Décomposition d'une commande type
+
+Prenons l'exemple :
+
+```bash
+python3 main.py bench --dataset IndustryOR --range 1 20 --runs 3 --temps 0,0.3,0.7
+```
+
+**Décomposition flag par flag :**
+
+| Partie | Signification |
+|--------|---------------|
+| `python3 main.py` | Lance le programme principal de LLoCO |
+| `bench` | Sous-commande "benchmark de variabilité" (au lieu de `batch` qui ne fait qu'un seul run) |
+| `--dataset IndustryOR` | Utilise le dataset `IndustryOR` (le `.json` JSONL avec 100 problèmes) |
+| `--range 1 20` | Sélectionne les problèmes d'**ID 1 à 20 inclus** (donc 20 problèmes) |
+| `--runs 3` | Lance **3 runs indépendants par température** |
+| `--temps 0,0.3,0.7` | Teste **3 températures** : `0` (déterministe), `0.3` (peu variable), `0.7` (créatif) |
+| (pas de `--model`) | Modèle par défaut en mode bench = `gpt-4o` |
+
+**Calcul du nombre de jobs :**
+
+```
+3 températures × 3 runs × 20 problèmes = 180 résolutions au total
+```
+
+Le bench va donc lancer **9 batchs** (3 températures × 3 runs), chaque batch traitant les 20 problèmes :
+
+```
+[1/9]  temp=0   run 1/3  → traite les 20 problèmes
+[2/9]  temp=0   run 2/3  → traite les 20 problèmes
+[3/9]  temp=0   run 3/3  → traite les 20 problèmes
+[4/9]  temp=0.3 run 1/3  → traite les 20 problèmes
+[5/9]  temp=0.3 run 2/3  → traite les 20 problèmes
+[6/9]  temp=0.3 run 3/3  → traite les 20 problèmes
+[7/9]  temp=0.7 run 1/3  → traite les 20 problèmes
+[8/9]  temp=0.7 run 2/3  → traite les 20 problèmes
+[9/9]  temp=0.7 run 3/3  → traite les 20 problèmes
+```
+
+**Structure de sortie créée :**
+
+```
+benchmarks/IndustryOR_gpt-4o_<timestamp>/
+├── config.json                 # config complète (reproductibilité)
+├── temp_0/
+│   ├── run_1.csv               # batch_results.csv du run 1
+│   ├── run_2.csv
+│   ├── run_3.csv
+│   └── per_problem.csv         # stats agrégées sur les 3 runs
+├── temp_0.3/
+│   ├── run_1.csv
+│   ├── run_2.csv
+│   ├── run_3.csv
+│   └── per_problem.csv
+├── temp_0.7/
+│   └── ...
+├── overall.csv                 # 1 ligne par température (résumé global)
+└── summary.txt                 # rapport humain à lire
+```
+
+**Exemple réel de tableau OVERALL produit par un bench `ComplexOR --all --runs 5 --model gpt-4o --temps 0,0.7` :**
+
+```
+    temp | problems | runs | avg pass | fully ✅ | fully ❌ | stable |    avg σ
+     0.0 |    18    |   5  |   55.6%  |    9     |    7     |   17   |   0.41667
+     0.7 |    18    |   5  |   44.4%  |    5     |    8     |   14   |  11.69636
+```
+
+→ Lecture immédiate :
+- **`temp=0` est meilleur sur tous les indicateurs** : pass rate 55.6% > 44.4%, plus de problèmes "fully ✅" (9 vs 5), moins de "fully ❌" (7 vs 8)
+- **`temp=0` est aussi nettement plus stable** : 17/18 problèmes produisent toujours le même objectif (vs 14/18 à `temp=0.7`)
+- **L'écart-type explose à `temp=0.7`** : σ moyen = 11.7 vs 0.42 à `temp=0` — quand le pipeline diverge à haute température, il produit des objectifs très différents
+- **Note importante** : `gpt-4o` à `temp=0` n'est **pas 100% déterministe** (1 problème instable sur 18). C'est attendu : OpenAI ne garantit pas le déterminisme strict même à `temp=0` sans seed.
+
+**Exemple réel de tableau COMPARISON (extrait) :**
+
+```
+    id |  t=0.0  |  t=0.7
+     1 |   5/5   |   5/5    ← stable parfait sur les deux
+     4 |   5/5   |   3/5    ← car_selection : variabilité à t=0.7
+     6 |   5/5   |   2/5    ← cutting_stock : 3 objectifs différents à t=0.7
+    14 |   3/5   |   0/5    ← netmcol : régression nette à t=0.7
+    17 |   5/5   |   4/5    ← revenue_maximization : légère perte
+```
+
+→ Permet d'identifier les problèmes qui **souffrent** de la variabilité (cutting_stock, netmcol) vs ceux qui restent **robustes** (aircraft_assignment, diet_problem, knapsack...).
+
+**Conclusion empirique sur ce bench :** Pour ComplexOR avec `gpt-4o`, **`temp=0` domine `temp=0.7`** — la créativité dégrade à la fois la qualité (pass rate ↓) et la reproductibilité (σ ↑). Pas de problème "sauvé" par `temp=0.7` dans ce run (aucun cas où `temp=0.7` ferait mieux que `temp=0`).
+
+**Coût mesuré pour ce bench :**
+
+- 18 problèmes × 5 runs × 2 températures = **180 résolutions**
+- Durée totale : **7333.3s ≈ 2h 2min**
+- Soit ~40s par résolution en moyenne
+
+À surveiller selon le quota Akkodis disponible.
+
+#### Architecture (`bench.py`)
+
+| Fonction | Rôle |
+|----------|------|
+| `BenchConfig` | Dataclass de config sérialisée en `config.json` |
+| `aggregate_per_problem()` | Stats par problème : pass_rate, n_unique_objectives, mean, std, min/max |
+| `aggregate_overall()` | Stats globales : avg_pass_rate, fully_passing, fully_stable, avg_std |
+| `write_per_problem_csv()` | Export CSV per-problem |
+| `write_overall_csv()` | Export CSV overall (1 ligne par température) |
+| `write_summary_txt()` | Rapport humain avec 3 tableaux (OVERALL / PER-PROBLEM / COMPARISON) |
+| `run_benchmark()` | Orchestrateur — lance N×M batch_run avec problems_root isolé |
+
+#### Structure de sortie
+
+```
+benchmarks/<dataset>_<model>_<YYYYMMDD_HHMMSS>/
+├── config.json                # config complète (reproductibilité)
+├── temp_0.0/
+│   ├── run_1.csv              # batch_results bruts par run
+│   ├── ...
+│   ├── run_5.csv
+│   └── per_problem.csv        # stats agrégées par problème
+├── temp_0.7/
+│   ├── ...
+├── overall.csv                # 1 ligne par (model, temperature)
+└── summary.txt                # rapport human-readable
+```
+
+#### Métriques produites
+
+**Per-problem :**
+- `pass_rate` (n_passed / n_runs)
+- `n_unique_objectives` (1 = parfaitement stable)
+- `mean_objective` / `std_objective` / `min` / `max`
+- `statuses` (séquence des status par run)
+
+**Overall :**
+- `avg_pass_rate`
+- `fully_passing` (problèmes passant sur **tous** les runs)
+- `always_failing` (problèmes échouant sur **tous** les runs)
+- `fully_stable` (problèmes avec exactement 1 valeur d'objectif unique)
+- `avg_std_objective`
+
+#### Choix techniques
+
+- **Réutilisation pipeline** : `bench.run_benchmark` appelle `batch_run` (toutes les protections — timeouts, retries, INFEASIBLE, direction validation — sont actives)
+- **Isolation des runs** : chaque run a son propre `problems_root = <bench_dir>/temp_X/run_N_problems/` → pas de cache croisé entre runs
+- **Validation CLI** : exige une sélection explicite (`--all` / `--id` / etc.) pour éviter d'oublier
+- **Compat `gpt-5`** : la temperature n'est envoyée à l'API que si non-`None` (la valeur `default` dans `--temps` est mappée à `None`)
+- **Gitignore** : `benchmarks/` ajouté pour ne pas committer les résultats
+
+#### Validation
+
+Tests unitaires d'agrégation (3 runs, 2 problèmes) :
+- ✅ Problème stable détecté (`n_unique_objectives=1`, `std=0`)
+- ✅ Problème variable détecté (3 valeurs uniques, std≈4.08)
+- ✅ Timeouts comptés correctement dans `n_runs` mais exclus du calcul des stats numériques
+- ✅ Rendu `summary.txt` aligné, lisible, avec table COMPARISON quand ≥2 températures
+
+#### Impact
+
+Évaluation systématique et reproductible de la **stabilité du pipeline** sur l'ensemble des datasets. Permet de répondre à des questions comme :
+- "Le pipeline est-il déterministe à `temp=0` ?"
+- "Quelle est la variabilité de `gpt-4o` à `temp=0.7` sur ComplexOR ?"
+- "Quel modèle/temperature maximise le `pass@5` sur IndustryOR ?"
+
 ---
 
 ## 6) Recommandations futures
@@ -1014,6 +1318,22 @@ Séparation propre logique métier / affichage. `main.py` est allégé et plus l
 | `UI/utils.py` | Fonctions `hr`, `wlen`, `box`, `mode_str` déplacées depuis `main.py` | 5.12 |
 | `UI/utils.py` | Nouvelles fonctions `print_batch_*` (header, dry_run, running, timeout, result, summary) | 5.12 |
 | `main.py` | Suppression de tout le code d'affichage — appels délégués à `UI/utils.py` | 5.12 |
+| `llm_utils.py` | `LLM_MODEL` / `LLM_TEMPERATURE` — config module-level (env + override) | 5.13 |
+| `llm_utils.py` | `set_llm_config()` — fonction d'override global du modèle/temperature | 5.13 |
+| `llm_utils.py` | `openai_ask_requests` — paramètres `model`/`temperature` optionnels | 5.13 |
+| `llm_utils.py` | `temperature` envoyé dans le payload JSON uniquement si non-None (compat gpt-5) | 5.13 |
+| `llm_utils.py` | `summarize_problem_description` ne force plus `gpt-5` | 5.13 |
+| `main.py` | Flags CLI `--model` (gpt-5/gpt-4/gpt-4o/gpt-4o-mini) et `--temp` | 5.13 |
+| `main.py` | `llm_utils.set_llm_config(...)` appelé après `parse_args()` | 5.13 |
+| `main.py` | `batch_run` propage `--model`/`--temp` au subprocess enfant | 5.13 |
+| `UI/utils.py` | `print_batch_header` affiche `Model:   <model>  (temp=<value>)` | 5.13 |
+| `bench.py` | Nouveau module — orchestrateur `run_benchmark()` (N runs × M temps) | 5.14 |
+| `bench.py` | `aggregate_per_problem()` / `aggregate_overall()` — stats statistiques | 5.14 |
+| `bench.py` | `write_summary_txt()` — rapport humain OVERALL + PER-PROBLEM + COMPARISON | 5.14 |
+| `bench.py` | `BenchConfig` dataclass — config sérialisée en `config.json` | 5.14 |
+| `main.py` | Sous-parser `bench` avec `--runs`, `--temps`, `--output-root` | 5.14 |
+| `main.py` | Dispatch `args.cmd == "bench"` → `bench.run_benchmark(...)` | 5.14 |
+| `.gitignore` | Ajout `benchmarks/` pour ne pas committer les résultats de bench | 5.14 |
 
 ---
 
@@ -1039,3 +1359,5 @@ Les erreurs de qualité de modélisation (direction min/max, contraintes manquan
 - Flip de direction robuste indépendant du formatage (section 5.10)
 - Propagation du solution-timeout en mode batch (section 5.11)
 - Code d'affichage centralisé dans `UI/utils.py` (section 5.12)
+- Configuration runtime du modèle (`gpt-5/gpt-4/gpt-4o/gpt-4o-mini`) et de la temperature via `--model` / `--temp` (section 5.13)
+- Sous-commande `bench` pour benchmarks de variabilité multi-runs / multi-températures avec rapport agrégé (section 5.14)

@@ -356,13 +356,36 @@ def _llm_step_with_gating(
 # OpenAI / Akkodis API wrapper
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Global model / temperature configuration
+# ---------------------------------------------------------------------------
+# These can be overridden at runtime by main.py via set_llm_config(...) or
+# by setting the LLOCO_MODEL / LLOCO_TEMPERATURE environment variables.
+# Reasoning models (gpt-5, o3, o4-mini) only support temperature=1.0 (default).
+# Standard models (gpt-4, gpt-4o, gpt-4o-mini) accept any temperature in [0, 2].
+
+LLM_MODEL: str = os.environ.get("LLOCO_MODEL", "gpt-5")
+_env_temp = os.environ.get("LLOCO_TEMPERATURE")
+LLM_TEMPERATURE: Optional[float] = float(_env_temp) if _env_temp else None
+
+
+def set_llm_config(model: Optional[str] = None, temperature: Optional[float] = None):
+    """Override the default model/temperature for all subsequent LLM calls."""
+    global LLM_MODEL, LLM_TEMPERATURE
+    if model is not None:
+        LLM_MODEL = model
+    if temperature is not None:
+        LLM_TEMPERATURE = temperature
+
+
 def openai_ask_requests(
     messages,
-    model="gpt-5",
+    model=None,
     response_format=None,
     max_tokens=10000,
     timeout=90,
     max_retries=4,
+    temperature=None,
 ):
     """
     Robust wrapper:
@@ -370,7 +393,12 @@ def openai_ask_requests(
     - avoids JSONDecodeError
     - readable error messages (HTTP + preview)
     - automatic retry (timeout / 429 / 5xx)
+    - model / temperature default to module-level config when not specified
     """
+    if model is None:
+        model = LLM_MODEL
+    if temperature is None:
+        temperature = LLM_TEMPERATURE
 
     api_key = os.environ.get("OPENAI_API_KEY")
 
@@ -402,6 +430,11 @@ def openai_ask_requests(
         "max_tokens": max_tokens,
         "messages": messages,
     }
+
+    # Only send temperature when explicitly set — reasoning models (gpt-5, o3,
+    # o4-mini) reject any value other than the default and would error out.
+    if temperature is not None:
+        data["temperature"] = temperature
 
     if response_format is not None:
         data["response_format"] = response_format
@@ -464,7 +497,7 @@ def summarize_problem_description(prompt_path, context):
         {"role": "system", "content": prompt},
         {"role": "user", "content": context},
     ]
-    return openai_ask_requests(messages, model="gpt-5", timeout=180)
+    return openai_ask_requests(messages, timeout=180)
 
 
 def formalize_problem_description(prompt_path, hl_desc):
